@@ -4,38 +4,27 @@ NodeSeek 多账号自动签到。Cookie 失效时用**真实浏览器**重新登
 
 > 2026-10 起 NodeSeek 的登录接口增加了 Cloudflare Turnstile、FingerprintJS 指纹、`security_token` 三重校验，
 > 纯 HTTP 请求（含打码平台）已经无法登录。本项目改成「真浏览器登录 → 拿 cookie → 纯 HTTP 签到」，
-> 可直接跑在 VPS 上，也可以把登录那一步单独放到住宅/家宽 IP 的机器上。
+> 整套装在 VPS 上就能跑，不需要额外的机器。
 
 ---
 
 ## 一、三层结构：搞清楚哪一层要什么
 
-NodeSeek 的登录/签到其实是三件事叠在一起，**家宽 IP 只跟第①层有关**，而且只是"让①更顺"而不是"①的门票"：
+NodeSeek 的登录/签到其实是三件事叠在一起，各层依赖的东西不一样：
 
-| 层 | 内容 | 需要什么 | 需要家宽 IP？ | 多久碰一次 |
-|---|---|---|---|---|
-| ① Cloudflare 挑战 | Turnstile 组件 + FingerprintJS 指纹 | 真浏览器（**Camoufox**）+ 有头 + Xvfb | **不必须** | 只有重新登录时 |
-| ② 账号二次验证 | 邮箱动态验证码 | 绑定邮箱能收码 | 否 | 每台新设备一次 |
-| ③ 日常签到 | `POST /api/attendance` | 纯 cookie + `curl_cffi` | **完全不需要**（cookie 不绑 IP） | 每天 |
+| 层 | 内容 | 需要什么 | 多久碰一次 |
+|---|---|---|---|
+| ① Cloudflare 挑战 | Turnstile 组件 + FingerprintJS 指纹 | 真浏览器（**Camoufox**）+ 有头 + Xvfb | 只有重新登录时 |
+| ② 账号二次验证 | 邮箱动态验证码 | 绑定邮箱能收码 | 每台新设备一次 |
+| ③ 日常签到 | `POST /api/attendance` | 纯 cookie + `curl_cffi` | 每天 |
 
-**实测证据（2026-10-24）**：在一台普通机房 VPS（US-BNA，非家宽、无任何代理）上，
-Camoufox + 有头 Xvfb + 持久化 profile，一次性完成「密码登录 → 邮箱验证码 → 拿到 `session`/`pjwt`」，
-随后纯 HTTP 签到成功（"今天已完成签到"）。
-
-> 结论：**不需要专门买家宽机器**。家宽 IP 的真实价值是"让①更稳、降低触发风控的概率"，
-> 属于加速器/保险，不是必需品。真要加，就挂 `AGENT_PROXY`（住宅代理）当保险。
-
-**为什么以前"卡在机房 IP"**：那会儿用的是 Chromium 的 headless shell，
-Cloudflare 直接认成 bot（`NO_WEBGL` / Turnstile `onError`）——
-卡的是**指纹**，不是 IP。换成 Camoufox（指纹伪装 + WebGL 伪造）后机房 IP 也能过。
-
-**还是建议跑一下体检**（了解自己的机器，不是准入条件）：
+跑之前先体检一下（了解自己的机器环境）：
 
 ```bash
 python3 check_env.py
 ```
 
-它会查出口 IP 的 ASN、是不是机房 IP，然后真的打开登录页走一遍挑战，最后给结论。
+它会真的打开登录页走一遍挑战，最后给结论。
 
 ### 「每台新设备一次」——到底会不会变成「每 30 天一次」？
 
@@ -44,8 +33,8 @@ python3 check_env.py
 | 事实 | 证据 |
 |---|---|
 | NodeSeek 会「记住设备」 | 管理员原话：「普通登录会记住用户设备，登陆过的设备不会要求邮箱验证」 |
-| 实测：同一 profile 第二次登录**免码** | 2026-10-24：23:09 走完邮箱验证 → 23:16 直接登录成功，没有验证码 |
-| 登录 cookie 约 30 天过期 | 社区实测：「按日期看登录后一个月就得失效了」 |
+| 同一 profile 第二次登录**免码** | 已验证：走完邮箱验证后，再次登录直接成功，没有验证码 |
+| 登录 cookie 约 30 天过期 | 社区结论：「按日期看登录后一个月就得失效了」 |
 | 30 天后重新登录还要不要码？ | **官方没承诺过** —— 所以项目不能靠"应该不会"来赌 |
 
 针对这最后一条，本项目做了两件事把不确定性消掉：
@@ -59,7 +48,7 @@ python3 check_env.py
 （profile 里有登录痕迹却仍被要求验证码），立刻推 Telegram，并直接告诉你怎么办。
 → 项目不会「静默失败好几天」。
 
-想自己实测这个结论，不用等 30 天：
+想自己验证这个结论，不用等 30 天：
 
 ```bash
 python3 diagnose_device_memory.py status     # 看现状：记住了什么、还剩几天
@@ -95,19 +84,7 @@ python3 diagnose_device_memory.py simulate   # 模拟 30 天后 cookie 过期，
 
 ---
 
-## 三、三种部署形态
-
-| 形态 | 说明 | 适合 |
-|---|---|---|
-| **A. 全部在本机** | VPS 上直接跑脚本，浏览器也在本机 | 单台机器、IP 干净 |
-| **B. 青龙在 Docker，登录在宿主机** | 青龙调 `http://172.17.0.1:3000` | 青龙容器重建不丢浏览器环境（推荐） |
-| **C. 登录放在另一台机器** | 青龙调 `http://另一台机器IP:3000` | 想用住宅代理/家宽出口时的保险方案 |
-
-三种形态代码是同一套，只差环境变量。
-
----
-
-## 四、快速开始（Debian 12/13、Ubuntu 22.04+）
+## 三、快速开始（Debian 12/13、Ubuntu 22.04+）
 
 ```bash
 git clone https://github.com/EmersonLopez2005/nodeseek-autosign.git
@@ -149,30 +126,9 @@ vi .env            # NS_USER_PASS=用户名&密码
 > 万一设备记忆真的失效了，你会收到一条「⚠️ 设备记忆失效」的 Telegram 告警，
 > 里面直接写着该怎么做 —— 不会静默失败好几天。
 
-### 青龙在 Docker 里（形态 B）
-
-浏览器环境装在**宿主机**，青龙容器只负责调用：
-
-```bash
-# 宿主机
-bash install_vps.sh --agent      # 注册 systemd 服务，监听 0.0.0.0:3000
-curl -s http://127.0.0.1:3000/health
-```
-
-青龙环境变量：
-
-```
-LOGIN_AGENT_URL=http://172.17.0.1:3000
-LOGIN_AGENT_TOKEN=<.env 里的 AGENT_TOKEN>
-NS_USER_PASS=用户1&密码1&用户2&密码2
-```
-
-> 安全：agent 只应在内网/本机可达。如果 VPS 有公网 IP，务必用防火墙挡掉 3000 端口，
-> 只放行 docker 网段：`ufw allow from 172.17.0.0/16 to any port 3000`。
-
 ---
 
-## 五、多账号模式
+## 四、多账号模式
 
 一个环境变量搞定，`&` 分隔、两两一组：
 
@@ -214,7 +170,7 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 ---
 
-## 六、主要配置项
+## 五、主要配置项
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -248,11 +204,11 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 ---
 
-## 七、排错
+## 六、排错
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 卡在 "Just a moment" | IP 被 CF 判高风险 | 换 IP 或挂住宅代理，换引擎没用 |
+| 卡在 "Just a moment" | IP 被 CF 判高风险 | 换 IP 或挂代理（`AGENT_PROXY`），换引擎没用 |
 | 页面弹「人机验证服务加载失败」 | 无头模式 / 点错了隐藏元素 | 用有头（默认），代码已改成坐标点击 |
 | 日志里 `Turnstile 组件状态：verifying` 卡 30 秒 | 组件在转圈计算，期间被重复点击会取消重来 | 已修：现在只点 1~2 次，间隔 ≥15 秒。若仍卡住说明 IP 评分不够 |
 | `TURNSTILE_INTERACT`（弹「人机验证服务加载失败」） | Turnstile 把点击判成 bot：点击按住时长≈0，或 WebGL 暴露 SwiftShader | 已修：按下-松开间隔 60~140ms；去掉 `--disable-gpu`；**必须 `apt install -y libgl1-mesa-dri`** |
@@ -270,13 +226,13 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 ---
 
-## 八、目录结构
+## 七、目录结构
 
 ```
 .
 ├── install_vps.sh                 一键安装（系统依赖 / Camoufox / venv / systemd）
 ├── check_env.py                   VPS 体检：IP 类型 + 真实挑战测试
-├── diagnose_device_memory.py      诊断：设备记忆还在不在（实测要不要验证码）
+├── diagnose_device_memory.py      诊断：设备记忆还在不在（要不要验证码）
 ├── multi_site_sign_cookie_only.py 主脚本：签到 + 主动续期 + 登录恢复
 ├── browser_login.py               登录适配层（远程 agent 优先，本地兜底）
 ├── notify.py                      通知（TG / 企业微信 / 钉钉 / Bark…）
@@ -304,7 +260,7 @@ cookie/
 
 ---
 
-## 九、卸载
+## 八、卸载
 
 **最省事的做法：一键脚本**
 
@@ -344,7 +300,7 @@ tar -xzf /root/nodeseek-backup-*.tar.gz -C "$PWD/"   # 恢复 .env 和 cookie
 
 下面是不用脚本时的手动步骤。
 
-### 9.1 systemd 服务（`install_vps.sh --agent` 装的）
+### 8.1 systemd 服务（`install_vps.sh --agent` 装的）
 
 ```bash
 sudo systemctl disable --now nodeseek-login-agent
@@ -352,7 +308,7 @@ sudo rm -f /etc/systemd/system/nodeseek-login-agent.service
 sudo systemctl daemon-reload
 ```
 
-### 9.2 Docker
+### 8.2 Docker
 
 ```bash
 cd agent
@@ -362,7 +318,7 @@ docker compose down -v --rmi local
 `-v` 会连数据卷一起删（profile、cookie 全没），`--rmi local` 删掉构建的镜像。
 只想停服务、保留数据就把 `-v --rmi local` 去掉。
 
-### 9.3 定时任务
+### 8.3 定时任务
 
 ```bash
 crontab -l | grep -v nodeseek-autosign | crontab -
@@ -370,12 +326,12 @@ crontab -l | grep -v nodeseek-autosign | crontab -
 
 这条会把含 `nodeseek-autosign` 的行全删掉。不放心就 `crontab -e` 手动删那一行。
 
-### 9.4 目录和浏览器内核
+### 8.4 目录和浏览器内核
 
 ```bash
 rm -rf /opt/nodeseek-autosign      # 换成你实际 clone 的路径
 
-# Camoufox 本体约 1.3GB（实测在用的就是它）
+# Camoufox 本体约 1.3GB
 du -sh ~/.cache/camoufox ~/.cache/ms-playwright ~/.cache/patchright 2>/dev/null
 rm -rf ~/.cache/camoufox ~/.cache/ms-playwright ~/.cache/patchright
 ```
@@ -398,7 +354,7 @@ sudo sed -i '/swapfile/d' /etc/fstab
 > 只在确认那个 swapfile 是本项目建的、且系统没有其他 swap 依赖时才删。
 > 删之前 `free -h` 看一眼，别把自己内存搞崩。
 
-### 9.5 青龙侧
+### 8.5 青龙侧
 
 环境变量里删掉这些：
 
@@ -410,7 +366,7 @@ LOGIN_LOCAL_FALLBACK  LOGIN_LOCAL_HEADLESS  AGENT_ENGINE  AGENT_PROXY
 
 定时任务里删掉执行主脚本的那条。
 
-### 9.6 确认清干净
+### 8.6 确认清干净
 
 ```bash
 systemctl status nodeseek-agent 2>&1 | head -3   # 应显示 not-found
@@ -426,7 +382,7 @@ ls -d /opt/nodeseek-autosign ~/.cache/camoufox ~/.cache/ms-playwright 2>/dev/nul
 
 ---
 
-## 十、说明
+## 九、说明
 
 - 本工具只做「自动点击签到」，不刷帖、不刷积分、不做任何互动行为。
 - 请遵守 NodeSeek 的站点规则；账号因自动化被封与本项目无关。

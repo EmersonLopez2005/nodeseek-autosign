@@ -52,7 +52,7 @@ NS_COOKIE=session=aaa; pjwt=aaa.jwt; cf_clearance=bbb&session=ccc; pjwt=ccc.jwt;
 2. F12 → Application（应用）→ Cookies → `https://www.nodeseek.com`
 3. 至少要有 `session`（服务端会话）和 `pjwt`（登录 JWT）；有 `cf_clearance` 更好（有效期约 30 分钟到几小时）
 
-> **实测更正（2026-10）**：早期文档写的 `sessionid` 这个名字在现在的站点上**并不存在**，
+> **更正（2026-10）**：早期文档写的 `sessionid` 这个名字在现在的站点上**并不存在**，
 > 登录成功后拿到的是 `session` + `pjwt` + `smac`。
 > 脚本判定「已登录」看的就是这几个字段，所以 cookie 里没有 `sessionid` 是正常的。
 
