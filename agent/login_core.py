@@ -30,6 +30,7 @@ import random
 import re
 import time
 from typing import Optional
+from urllib.parse import unquote
 
 BOARD_URL = "https://www.nodeseek.com/board"
 LOGIN_URL = "https://www.nodeseek.com/signIn.html"
@@ -431,16 +432,121 @@ def _reload_login_page(page):
 
 
 def _dismiss_dialog(page):
-    """关掉站点 mscAlert 之类的弹窗，否则它会挡住输入框。"""
-    for txt in ["OK", "确定", "知道了", "关闭"]:
+    """关掉站点 mscAlert 之类的模态弹窗，否则它会盖住输入框导致点击超时。
+
+    实测（2026-10）：emailSignIn 页面发码后会弹一个带 '×' / 'OK' 按钮的模态框，
+    它盖在验证码输入框上，locator.click() 直接 TimeoutError。
+    """
+    # 1) 先找带文字的确认按钮
+    for txt in ["OK", "确定", "知道了", "关闭", "好"]:
         try:
-            loc = page.get_by_role("button", name=txt).first
+            loc = page.get_by_role("button", name=txt, exact=True).first
             if loc.count() > 0 and loc.is_visible():
-                loc.click(timeout=1500)
-                page.wait_for_timeout(300)
-                return
+                loc.click(timeout=2500)
+                page.wait_for_timeout(400)
+                _log("已关闭弹窗")
+                return True
         except Exception:
             continue
+
+    # 2) 再找常见的关闭元素（mscAlert 的 × / .close / [aria-label=close]）
+    for sel in [
+        ".msc-alert .close",
+        ".modal .close",
+        "button[aria-label='Close']",
+        "button[aria-label='close']",
+        "[data-dismiss='modal']",
+        ".msc-alert button",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=2500)
+                page.wait_for_timeout(400)
+                _log("已关闭弹窗")
+                return True
+        except Exception:
+            continue
+
+    # 2b) 弹窗按钮定位不到时，用坐标点击（Camoufox 下 locator 点击常点不到实位）
+    try:
+        clicked = page.evaluate(
+            """() => {
+                const cands = [];
+                for (const el of document.querySelectorAll('button, .close, [aria-label*=close i], [aria-label*=Close]')) {
+                    const t = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                    if (t === 'OK' || t === '×' || t === 'x' || t === 'X' || t === '关闭' || t === '确定') {
+                        const st = window.getComputedStyle(el);
+                        if (st.display !== 'none' && st.visibility !== 'hidden') {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                cands.push({x: r.x + r.width/2, y: r.y + r.height/2, t});
+                            }
+                        }
+                    }
+                }
+                return cands;
+            }"""
+        )
+        for c in (clicked or [])[:3]:
+            try:
+                page.mouse.move(c["x"], c["y"], steps=8)
+                page.wait_for_timeout(150)
+                page.mouse.down()
+                page.wait_for_timeout(80)
+                page.mouse.up()
+                page.wait_for_timeout(400)
+                _log(f"已坐标点击弹窗按钮 {c.get('t')!r}")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 3) 兜底：JS 直接把可能的遮罩层移除
+    try:
+        removed = page.evaluate(
+            """() => {
+                let n = 0;
+                for (const sel of ['.msc-alert', '.modal-backdrop', '.modal.show', '[role="dialog"]']) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        const st = window.getComputedStyle(el);
+                        if (st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0') {
+                            el.remove(); n++;
+                        }
+                    });
+                }
+                return n;
+            }"""
+        )
+        if removed:
+            page.wait_for_timeout(300)
+            _log(f"已移除 {removed} 个弹窗/遮罩元素")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _fill_input_safe(loc, value: str, label: str = "") -> bool:
+    """填输入框，优先 fill()（不受遮挡影响），失败再退回 click+type。
+
+    实测：locator.click() 在被模态框遮挡时会 TimeoutError，
+    而 fill() 直接设值不依赖可点击性。
+    """
+    try:
+        loc.fill(value)
+        return True
+    except Exception as e:
+        _log(f"{label} fill() 失败（{type(e).__name__}），改用 click+type")
+    try:
+        loc.click(timeout=4000)
+        loc.fill("")
+        loc.type(value, delay=random.randint(50, 120))
+        return True
+    except Exception as e:
+        _log(f"{label} 填值彻底失败：{type(e).__name__}")
+        return False
 
 
 def _signin_via_page_fetch(page, username: str, password: str):
@@ -618,6 +724,25 @@ def _handle_email_verify(page, redirect: str, username: str):
         _log(f"发送后按钮状态：{btn_text!r}（若显示倒计时说明发码成功）")
     except Exception:
         pass
+    # 读一下弹窗内容：发码成功/失败的提示都在弹窗里，比倒计时更直接
+    try:
+        dlg = page.evaluate(
+            """() => {
+                for (const sel of ['.msc-alert', '.modal.show', '[role="dialog"]', '.swal2-container']) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                        const t = (el.innerText || '').trim();
+                        if (t) return t.slice(0, 300);
+                    }
+                }
+                return '';
+            }"""
+        )
+        if dlg:
+            _log(f"发码后弹窗内容：{dlg!r}")
+    except Exception:
+        pass
     try:
         _dump_form_structure(page)
     except Exception:
@@ -645,7 +770,38 @@ def _handle_email_verify(page, redirect: str, username: str):
         _log(f"验证码格式异常（{code!r}），请确认复制的是邮件正文里的那一串验证码")
         return None
 
-    # 5) 填入 Validation Code 输入框
+    # 5) 先关掉可能弹出的模态框（它会盖住输入框，导致 click 超时）
+    _dismiss_dialog(page)
+
+    # 6) 显式填邮箱（emailSignIn 的 Email 框可能没被前端自动填充）
+    try:
+        email_hint = ""
+        m = re.search(r"email=([^&]+)", redirect or "")
+        if m:
+            email_hint = unquote(m.group(1))
+        if email_hint:
+            email_input = _first_visible(
+                page,
+                ["input[placeholder='Email']", 'input[placeholder*="Email"]',
+                 'input[type="email"]', "input[name='email']"],
+                timeout=4000,
+            )
+            if email_input is not None:
+                cur_val = ""
+                try:
+                    cur_val = email_input.input_value() or ""
+                except Exception:
+                    pass
+                if not cur_val:
+                    if _fill_input_safe(email_input, email_hint, "邮箱框"):
+                        _log(f"已填入邮箱：{email_hint}")
+                        page.wait_for_timeout(300)
+                else:
+                    _log(f"邮箱框已有值：{cur_val}")
+    except Exception as e:
+        _log(f"填邮箱异常（不阻塞）：{type(e).__name__}")
+
+    # 7) 填入 Validation Code 输入框
     code_input = _first_visible(
         page,
         ["input[placeholder='Validation Code']", 'input[placeholder*="Code"]',
@@ -655,16 +811,18 @@ def _handle_email_verify(page, redirect: str, username: str):
     if code_input is None:
         _log("找不到验证码输入框")
         return None
+    if not _fill_input_safe(code_input, code, "验证码框"):
+        return None
+    # 确认一下真的填进去了
     try:
-        code_input.click(timeout=3000)
-        code_input.fill("")
-        code_input.type(code, delay=random.randint(50, 120))
-    except Exception as e:
-        _log(f"填验证码失败：{type(e).__name__}")
-        try:
+        filled = code_input.input_value() or ""
+        if filled.strip() != code:
+            _log(f"验证码框实际值 {filled!r} 与输入不一致，再试一次 fill")
             code_input.fill(code)
-        except Exception:
-            return None
+            filled = code_input.input_value() or ""
+        _log(f"验证码框已填入：{filled!r}")
+    except Exception:
+        pass
     page.wait_for_timeout(random.randint(300, 700))
 
     # 6) 点「登录」提交
