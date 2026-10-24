@@ -284,11 +284,13 @@ def check_challenge(url, headless, wait=45):
                     if wtxt:
                         say(tag, f"  组件内文字：{wtxt!r}")
                     last_state = state
-                if tok or state in ("success", "error"):
+                # 8 秒后无条件点一次：不看 state（verifying 可能是误判，不点就永远干等）
+                if tok or state == "success":
                     break
-                if (not clicked) and state == "pending" and (time.time() - ts_start) > 8:
+                if (not clicked) and (time.time() - ts_start) > 8:
                     login_core._click_turnstile_checkbox(page)
                     clicked = True
+                    say(WARN, "已点击 Turnstile 复选框，等待组件计算…")
                 page.wait_for_timeout(1000)
 
             if tok:

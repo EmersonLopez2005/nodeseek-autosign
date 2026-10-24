@@ -228,11 +228,14 @@ def _click_turnstile_checkbox(page) -> bool:
 def _wait_turnstile(page, timeout=40):
     """等 Turnstile 完成验证。
 
-    实测教训（2026-10，AT&T 住宅 IP）：
-      点完复选框后组件会转圈计算 3~15 秒，这段时间内**再点一次会取消并重新开始**。
-      旧版每 4 秒点一次，30 秒点 7 次，结果永远停在转圈。
-      所以这里：先静默等 8 秒（托管模式常常自动通过，压根不用点），
-      没动静才点 1 次，之后只轮询不再点击。
+    实测教训（2026-10，AT&T 住宅 IP，Xvfb 有头 patchright）：
+      1) 点完复选框后组件转圈 3~15 秒，期间**再点会取消并重新开始**，
+         所以绝对不能每 4 秒点一次（旧版就是因此永远过不去）；
+      2) 但也**不能不点**——托管模式并不总是自动放行，该点还得点。
+         上一次改过头，状态误判成 verifying 后一次都没点，白等 40 秒。
+
+    所以策略是：先给 8 秒自动通过的机会 → 没动静就点一次 → 之后只等不点
+    （只有明确 error 才允许再点一次）。
 
     返回 token / "widget-ok"；拿不到明确信号返回 None（交给提交结果判断）。
     """
@@ -241,6 +244,9 @@ def _wait_turnstile(page, timeout=40):
     clicked = 0
     last_click = 0.0
     last_state = None
+
+    # 组件是异步渲染的，太早点会点到空白处
+    page.wait_for_timeout(2000)
 
     while time.time() < deadline:
         tok = _turnstile_token(page)
@@ -255,15 +261,6 @@ def _wait_turnstile(page, timeout=40):
         if state != last_state:
             _log(f"Turnstile 组件状态：{state}")
             last_state = state
-        if state == "error":
-            _log("Turnstile 报错，等 3 秒后重试一次")
-            page.wait_for_timeout(3000)
-            if clicked < 2:
-                _click_turnstile_checkbox(page)
-                clicked += 1
-                last_click = time.time()
-            page.wait_for_timeout(1000)
-            continue
 
         if "人机验证服务加载失败" in _body_text(page):
             raise LoginError(
@@ -273,10 +270,21 @@ def _wait_turnstile(page, timeout=40):
             )
 
         elapsed = time.time() - start
-        # 8 秒内不点，给托管模式自动通过的机会；
-        # 只有在「明确还没开始验证」（pending）时才点，verifying 期间绝不动
-        if (state == "pending" and elapsed > 8 and clicked < 2
-                and time.time() - last_click > 15):
+        # 8 秒后还没过就点一次。不看 state：
+        #   pending   → 还没开始，需要点
+        #   verifying → 可能真是转圈，也可能是状态误判；点一下最多重来一次，
+        #               总比一直干等强
+        if clicked == 0 and elapsed > 8 and time.time() - last_click > 3:
+            ok = _click_turnstile_checkbox(page)
+            last_click = time.time()
+            if ok:
+                clicked = 1
+                page.wait_for_timeout(600)
+                _log(f"点击后状态：{turnstile_state(page)}")
+            else:
+                _log("没定位到 Turnstile 组件，3 秒后重试点击")
+        elif state == "error" and clicked < 2 and time.time() - last_click > 10:
+            _log("Turnstile 报错，重新点一次")
             _click_turnstile_checkbox(page)
             clicked += 1
             last_click = time.time()
@@ -341,12 +349,12 @@ def turnstile_state(page) -> str:
             probe = fr.evaluate(
                 """() => {
                     const q = (s) => document.querySelector(s);
-                    const cb = q('input[type="checkbox"]');
                     const text = (document.body && document.body.innerText || '').trim();
-                    // 成功时组件会渲染 #success 或勾号 svg，checkbox 随之消失
-                    const hasSuccess = !!(q('#success, .success, [id*="success"], [class*="success"]'));
-                    // 转圈计算中：有 spinner / 没有 checkbox 且没有 success
-                    const hasSpinner = !!(q('.spinner, [class*="spinner"], [class*="loading"], svg circle'));
+                    const cb = q('input[type="checkbox"]');
+                    // 注意：不能用 svg circle 判“转圈”——组件本身那个圆形外框就是 circle，
+                    // 会导致初始状态被误判成 verifying，从而永远不点击。
+                    const hasSpinner = !!(q('#spinner') || q('.spinner') || q('[class*="spinner"]'));
+                    const hasSuccess = !!(q('#success') || q('.success'));
                     return {
                         checked: cb ? !!cb.checked : null,
                         hasCb: !!cb,
@@ -359,9 +367,7 @@ def turnstile_state(page) -> str:
         except Exception:
             continue
 
-        if probe.get("checked"):
-            return "success"
-        if probe.get("hasSuccess"):
+        if probe.get("checked") or probe.get("hasSuccess"):
             return "success"
         text = (probe.get("text") or "")
         low = text.lower()
@@ -369,7 +375,8 @@ def turnstile_state(page) -> str:
             return "error"
         if any(k in low for k in ("成功", "success", "verified", "验证通过")):
             return "success"
-        if probe.get("hasSpinner") or not probe.get("hasCb"):
+        # 只有在明确的 spinner 元素存在时才算“计算中”
+        if probe.get("hasSpinner"):
             return "verifying"
     return "pending" if found else "unknown"
 
