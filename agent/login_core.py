@@ -88,8 +88,12 @@ def _probe_webgl(page):
                 } catch (e) { return 'ERR_' + (e.message || e); }
             }"""
         )
-        if "swiftshader" in (r or "").lower():
-            _log(f"WebGL 渲染器：{r}  ← 这就是被拒的原因，执行：apt install -y libgl1 libgl1-mesa-dri")
+        r = (r or "").strip()
+        if "swiftshader" in r.lower():
+            _log(f"WebGL 渲染器：{r}  ← 这是 CF 已知 bot 特征，执行：apt install -y libgl1 libgl1-mesa-dri")
+        elif r in ("NO_WEBGL", "NO_EXT", "ERR", "") or r.startswith("ERR_"):
+            _log(f"WebGL 渲染器：{r}  ← 浏览器完全没有 WebGL！正常桌面不会这样，"
+                 f"Turnstile 必拒。修复：apt install -y libgl1 libgl1-mesa-dri 后重跑")
         else:
             _log(f"WebGL 渲染器：{r}")
     except Exception:
