@@ -68,10 +68,13 @@ AUTH_PROBE_API = "/api/account/credit/page-1"
 class LoginError(Exception):
     """带错误码的登录异常，方便上游区分是“要重试”还是“要人工介入”。"""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, device_memory_expired: bool = False):
         super().__init__(f"[{code}] {message}")
         self.code = code
         self.message = message
+        # True = 这台设备之前登录过，这次仍被要求邮箱验证
+        #       → NodeSeek 的「记住设备」可能已失效，需要告警而不是静默重试
+        self.device_memory_expired = device_memory_expired
 
 
 # --------------------------------------------------------------------------
@@ -663,6 +666,254 @@ def _signin_via_page_fetch(page, username: str, password: str):
         return None
 
 
+def _prior_login_traces(page) -> str:
+    """检查浏览器 profile 里是否留有「之前登录过这台设备」的痕迹。
+
+    用途：区分两种「需要邮箱验证码」：
+      · 首次在新设备/新 profile 上登录 → 要码是正常的
+      · 这台设备之前登录过（profile 里有痕迹），这次仍要码
+        → 说明 NodeSeek 侧的「记住设备」状态已经失效了（需要告警）
+
+    痕迹来源（都在同一 origin 的持久化存储里）：
+      · localStorage 里的 security_token（登录页前端会生成）
+      · profile 目录里存过的 NodeSeek cookie（登录态 cookie 已被清掉时只剩名字）
+    返回一段描述文字，没有痕迹则返回空串。
+    """
+    found = []
+    try:
+        ls = page.evaluate(
+            """() => {
+                const out = [];
+                try {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (k) out.push(k);
+                    }
+                } catch (e) {}
+                return out;
+            }"""
+        )
+        if isinstance(ls, list) and ls:
+            for k in ls:
+                if k in ("security_token", "__ns_api_log"):
+                    found.append(k)
+    except Exception:
+        pass
+
+    try:
+        names = [c.get("name") for c in (page.context.cookies() or [])]
+        # session/pjwt/smac 已经不在了（否则这轮就登录成功了），
+        # 但如果还留着 cf_clearance 之类的，说明这台设备确实来过。
+        if any(n in ("cf_clearance", "fog", "hmti_") for n in names):
+            found.append("cf_clearance/fog")
+    except Exception:
+        pass
+
+    if not found:
+        return ""
+    return "、".join(dict.fromkeys(found))
+
+
+def _obtain_email_code(timeout: int = 0) -> str:
+    """拿到邮箱验证码。三级降级，任何一级成功就返回。
+
+    级别 1（自动，推荐）：验证码落地文件
+        在邮箱里设一条「转发规则」，把 NodeSeek 的邮件自动转发到一个
+        「落地文件」服务（下面两种任选），脚本轮询该文件即可自动取码。
+        完全不需要把邮箱密码交给脚本。
+
+        · NS_CODE_FILE   —— 本机文件路径。转发到一个能写这个路径的
+                           脚本/钩子即可（curl 到 webhook、mailhook、
+                           或任意自建小服务）。
+        · NS_CODE_URL    —— HTTP(S) 地址，返回纯文本验证码内容。
+
+    级别 2：IMAP 自动收码（可选，需要你显式配置）
+        NS_IMAP_HOST / NS_IMAP_PORT / NS_IMAP_USER / NS_IMAP_PASS
+        仅在你愿意把「邮箱授权码」（不是登录密码）交给脚本时使用。
+
+    级别 3：终端手动输入（兜底）
+        前两级都没配时，退回交互式输入；cron 里没有终端则直接失败，
+        并提示怎么配置自动收码。
+
+    设计原则：默认什么都不配 → 行为与从前完全一致（手动输入）。
+    只有你主动配置了自动收码，才会走无人值守路径。
+    """
+    timeout = timeout or int(os.getenv("NS_CODE_TIMEOUT", "180") or 180)
+
+    # ---------- 级别 1：验证码落地文件 / HTTP ----------
+    file_path = os.getenv("NS_CODE_FILE", "").strip()
+    code_url = os.getenv("NS_CODE_URL", "").strip()
+    if file_path or code_url:
+        code = _poll_code_from_source(file_path, code_url, timeout)
+        if code:
+            _log(f"已自动获取验证码：{code[:4]}…{code[-4:]}（共{len(code)}位）")
+            return code
+        _log("自动收码超时/失败，尝试下一级")
+
+    # ---------- 级别 2：IMAP ----------
+    if os.getenv("NS_IMAP_HOST", "").strip() and os.getenv("NS_IMAP_USER", "").strip():
+        code = _poll_code_imap(timeout)
+        if code:
+            _log(f"已通过 IMAP 自动获取验证码：{code[:4]}…{code[-4:]}（共{len(code)}位）")
+            return code
+        _log("IMAP 收码超时/失败，尝试下一级")
+
+    # ---------- 级别 3：手动输入 ----------
+    try:
+        raw = input("请输入邮箱验证码：").strip()
+        return raw
+    except EOFError:
+        _log("当前不是交互式终端（cron / 管道），无法手动输入验证码。")
+        _log("要实现完全无人值守，配以下任一种即可（都不需要交出邮箱密码）：")
+        _log("  · NS_CODE_FILE=/路径/验证码.txt   邮箱转发规则把邮件写入该文件")
+        _log("  · NS_CODE_URL=https://…            返回纯文本验证码的 HTTP 地址")
+        _log("  · NS_IMAP_HOST/NS_IMAP_USER/NS_IMAP_PASS  用邮箱授权码收信")
+        _log("详见 部署指南_账号密码自动登录.md「让验证码也自动化」一节。")
+        return ""
+    except Exception:
+        return ""
+
+
+def _extract_code_from_text(text: str) -> str:
+    """从邮件正文/文本里抠出验证码。
+
+    NodeSeek 的验证码实测是 24 位十六进制串（如 8415f1a2b52331d5a2b9078e）。
+    但不同批次可能是别的字母数字组合，所以：
+      1) 优先匹配「验证码/validation code/code」附近的长串字母数字
+      2) 兜底匹配整段文本里最长的 16~64 位字母数字串
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    # 去掉 HTML 标签
+    plain = re.sub(r"<[^>]+>", " ", t)
+    plain = re.sub(r"&nbsp;?", " ", plain)
+
+    # 1) 关键词附近找
+    for kw in ("验证码", "校验码", "动态码", "validation code", "verification code",
+               "your code", "code"):
+        for m in re.finditer(re.escape(kw), plain, re.IGNORECASE):
+            tail = plain[m.end(): m.end() + 120]
+            cand = re.search(r"[A-Za-z0-9]{16,64}", tail)
+            if cand:
+                return cand.group(0)
+
+    # 2) 整段找最长的字母数字串（>=16 位）
+    cands = re.findall(r"[A-Za-z0-9]{16,64}", plain)
+    if cands:
+        return max(cands, key=len)
+    return ""
+
+
+def _poll_code_from_source(file_path: str, code_url: str, timeout: int) -> str:
+    """轮询验证码来源（文件或 HTTP），拿到就返回。
+
+    文件方式会记住上次读到的内容，避免读到旧验证码重复提交。
+    """
+    deadline = time.time() + timeout
+    last_seen = ""
+    if file_path and os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                last_seen = f.read()
+        except Exception:
+            pass
+
+    while time.time() < deadline:
+        raw = ""
+        if file_path:
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        raw = f.read()
+            except Exception:
+                raw = ""
+        if not raw and code_url:
+            try:
+                import urllib.request
+                req = urllib.request.Request(code_url, headers={"User-Agent": "ns-code/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+            except Exception as e:
+                _dbg(f"取验证码 HTTP 失败：{type(e).__name__}")
+
+        if raw and raw.strip() and raw.strip() != last_seen.strip():
+            code = _extract_code_from_text(raw)
+            if code:
+                return code
+        time.sleep(3)
+    return ""
+
+
+def _poll_code_imap(timeout: int) -> str:
+    """IMAP 自动收码（可选功能，需要你显式配置邮箱授权码）。"""
+    try:
+        import imaplib
+        import email as _email
+        from email.header import decode_header
+    except Exception:
+        return ""
+
+    host = os.getenv("NS_IMAP_HOST", "").strip()
+    port = int(os.getenv("NS_IMAP_PORT", "993") or 993)
+    user = os.getenv("NS_IMAP_USER", "").strip()
+    pwd = os.getenv("NS_IMAP_PASS", "").strip()
+    folder = os.getenv("NS_IMAP_FOLDER", "INBOX").strip() or "INBOX"
+    sender_kw = os.getenv("NS_IMAP_SENDER", "nodeseek").strip().lower()
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            M = imaplib.IMAP4_SSL(host, port)
+            try:
+                M.login(user, pwd)
+                M.select(folder)
+                # 只看最近 10 封未读
+                typ, data = M.search(None, 'UNSEEN')
+                if typ == "OK" and data and data[0]:
+                    ids = data[0].split()[-10:]
+                    for mid in reversed(ids):
+                        typ, msg_data = M.fetch(mid, "(RFC822)")
+                        if typ != "OK":
+                            continue
+                        msg = _email.message_from_bytes(msg_data[0][1])
+                        subj = ""
+                        for part in msg.walk():
+                            if part.get_content_type() == "text/html":
+                                try:
+                                    subj = part.get_payload(decode=True).decode(
+                                        part.get_content_charset() or "utf-8", errors="ignore")
+                                except Exception:
+                                    pass
+                                break
+                            if part.get_content_type() == "text/plain" and not subj:
+                                try:
+                                    subj = part.get_payload(decode=True).decode(
+                                        part.get_content_charset() or "utf-8", errors="ignore")
+                                except Exception:
+                                    pass
+                        blob = json.dumps(msg.items(), ensure_ascii=False) + " " + (subj or "")
+                        if sender_kw and sender_kw not in blob.lower():
+                            continue
+                        code = _extract_code_from_text(subj or blob)
+                        if code:
+                            try:
+                                M.store(mid, "+FLAGS", "\\Seen")
+                            except Exception:
+                                pass
+                            return code
+            finally:
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+        except Exception as e:
+            _dbg(f"IMAP 收码失败：{type(e).__name__}: {e}")
+        time.sleep(5)
+    return ""
+
+
 def _handle_email_verify(page, redirect: str, username: str):
     """处理密码登录后的邮箱验证码二次确认（手动输入验证码版）。
 
@@ -786,25 +1037,20 @@ def _handle_email_verify(page, redirect: str, username: str):
     except Exception:
         pass
 
-    # 4) 停住，等用户去邮箱收码并输入
+    # 4) 取验证码（自动收码已配置则自动取，否则手动输入）
     _log("")
     _log("=" * 50)
-    _log("  请到绑定邮箱（[REDACTED]）查收验证码邮件")
-    _log("  提示：验证码是邮件正文里的一串字母数字（实测 24 位，")
-    _log("        如 8415f1a2b52331d5a2b9078e），整段复制过来即可")
-    _log("  然后在下方粘贴验证码并回车")
+    _log("  需要邮箱验证码（24 位字母数字串，如 8415f1a2b52331d5a2b9078e）")
+    if os.getenv("NS_CODE_FILE", "").strip() or os.getenv("NS_CODE_URL", "").strip() \
+            or (os.getenv("NS_IMAP_HOST", "").strip() and os.getenv("NS_IMAP_USER", "").strip()):
+        _log("  已配置自动收码，正在等待邮件…")
+    else:
+        _log("  请到绑定邮箱查收验证码邮件，整段复制过来即可")
+        _log("  （想让这一步也自动化，见部署指南「让验证码也自动化」）")
     _log("=" * 50)
-    try:
-        code = input("请输入邮箱验证码：").strip()
-    except EOFError:
-        _log("当前不是交互式终端（cron / 管道），无法手动输入验证码。")
-        _log("提示：验证码只用来「记住这台设备」一次——在终端里跑一次，"
-             "profile 记住设备后，后续密码登录就不再需要验证码。")
-        return None
-    except Exception:
-        code = ""
+    code = _obtain_email_code()
     if not code:
-        _log("未输入验证码，放弃邮箱验证")
+        _log("未取到验证码，放弃邮箱验证")
         return None
     code = code.strip().replace(" ", "")
     # 实测 NodeSeek 邮箱验证码是 24 位十六进制字符串（8415f1a2b52331d5a2b9078e），
@@ -939,7 +1185,8 @@ def _handle_email_verify(page, redirect: str, username: str):
         else:
             _log("站内接口没能确认登录态（可能网络/风控），按 cookie 判定成功")
         _log("邮箱验证登录成功")
-        return {"cookie": cookie, "cookies": all_cookies, "username": username}
+        _log(f"cookie 有效期：{describe_cookie_life(all_cookies)}")
+        return _login_result(cookie, all_cookies, username)
 
     if left_email_page:
         _log("页面已离开 emailSignIn，但没抓到登录态 cookie，再探一次接口…")
@@ -948,7 +1195,7 @@ def _handle_email_verify(page, redirect: str, username: str):
             all_cookies = page.context.cookies()
             cookie = cookies_to_string(all_cookies)
             _log(f"接口确认已登录，cookie：{_cookie_names(all_cookies)}")
-            return {"cookie": cookie, "cookies": all_cookies, "username": username}
+            return _login_result(cookie, all_cookies, username)
 
     # 没拿到登录态：把服务器原文打出来，看它到底说了什么
     api_log = _read_api_log(page)
@@ -1176,6 +1423,66 @@ def cookies_to_string(cookies, domain_hint="nodeseek.com") -> str:
             ordered.append(f"{k}={picked.pop(k)}")
     ordered += [f"{k}={v}" for k, v in picked.items()]
     return "; ".join(ordered)
+
+
+def cookie_expiry_info(cookies) -> dict:
+    """读出登录态 cookie 的到期时间，算出「还剩几天」。
+
+    为什么需要这个：NodeSeek 的 session cookie 约 30 天过期（论坛实测
+    「按日期看登录后一个月就得失效了」）。等它掉了才发现要重新登录，
+    很可能撞上「设备记忆失效 → 又要邮箱验证码」。所以要提前知道还剩多久。
+
+    Playwright 的 cookie 字典里 expires 是 Unix 时间戳（秒），-1 表示会话 cookie
+    （浏览器关掉就没了）。
+
+    返回结构（fields 是扁平映射，方便直接落成 meta.json）：
+      {"session": {"expires": 1795448303.0, "days_left": 30.0,
+                   "session_cookie": False}, ...}
+    """
+    out = {}
+    now = time.time()
+    for c in cookies or []:
+        name = c.get("name")
+        if not name or name not in AUTH_COOKIE_NAMES:
+            continue
+        exp = c.get("expires")
+        info = {"expires": exp, "session_cookie": False, "days_left": None}
+        if isinstance(exp, (int, float)) and exp > 0:
+            info["days_left"] = round((exp - now) / 86400.0, 2)
+        else:
+            info["session_cookie"] = True
+        out[name] = info
+    return out
+
+
+def describe_cookie_life(cookies) -> str:
+    """一行话讲清楚 cookie 还能活多久（给日志看）。"""
+    fields = cookie_expiry_info(cookies)
+    if not fields:
+        return "无登录态 cookie"
+    days = [(i["days_left"], n) for n, i in fields.items() if i.get("days_left") is not None]
+    if not days:
+        return "全部为会话 cookie（关浏览器即失效）"
+    d, name = min(days)
+    if d <= 0:
+        return f"{name} 已过期 {abs(d):.1f} 天"
+    return f"{name} 还剩 {d:.1f} 天"
+
+
+def _login_result(cookie: str, cookies: list, username: str) -> dict:
+    """登录成功的统一出口。
+
+    带上 cookie 的到期信息（expires / 还剩几天），让上层能判断
+    「这次拿到的 cookie 还能用多久、要不要提前主动换新」，
+    而不用等 cookie 掉了才知道要重新登录。
+    """
+    return {
+        "cookie": cookie,
+        "cookies": cookies,
+        "username": username,
+        "expiry": cookie_expiry_info(cookies),
+        "cookie_life": describe_cookie_life(cookies),
+    }
 
 
 def _auth_cookie_present(cookies) -> bool:
@@ -1507,7 +1814,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 _log("⚠️ 有 cookie 但站内接口判定未登录，按未登录处理")
             else:
                 _log("登录成功（已拿到登录态 cookie）")
-                return {"cookie": cookie, "cookies": all_cookies, "username": username}
+                return _login_result(cookie, all_cookies, username)
 
         # 没有 sessionid：优先用主动 fetch 拿到的响应体，其次读拦截器，最后读网络层响应
         status = None
@@ -1574,7 +1881,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 _log(f"刷新后 cookie：{_cookie_names(all_cookies)}")
                 if _auth_cookie_present(all_cookies):
                     _log("登录成功（刷新后拿到登录态 cookie）")
-                    return {"cookie": cookie, "cookies": all_cookies, "username": username}
+                    return _login_result(cookie, all_cookies, username)
             except Exception as e:
                 _log(f"刷新取 cookie 失败：{type(e).__name__}")
 
@@ -1582,12 +1889,34 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         # 说明账号或「新设备」需要邮箱验证码二次确认。这是登录流程的一部分，不是失败。
         if data and isinstance(data, dict) and data.get("success") and data.get("redirect"):
             redirect = data.get("redirect") or ""
+            # 诊断：这次要码，是「这台设备第一次登录」还是「设备记忆失效了」？
+            # 依据 = profile 里之前有没有留过 NodeSeek 的登录态痕迹
+            #   · 有痕迹 → 之前登录过，这次仍要码 → 设备记忆可能过期了（异常，要告警）
+            #   · 没痕迹 → 首次登录，正常流程，本来就该要码
+            prior = _prior_login_traces(page)
+            if prior:
+                _log(f"⚠️ 这台设备之前登录过（profile 里有 {prior}），本次仍要求邮箱验证")
+                _log("   → 说明 NodeSeek 侧的「记住设备」状态可能已过期，"
+                     "或换了出口 IP / 换了浏览器指纹")
+                device_memory_expired = True
+            else:
+                _log("首次在新设备上登录，需要邮箱验证码属正常流程")
+                device_memory_expired = False
+
             _log(f"密码验证通过，但需要二次验证，redirect={redirect}")
             email_verify = _handle_email_verify(page, redirect, username)
             if email_verify:
+                email_verify["device_memory_expired"] = device_memory_expired
+                if device_memory_expired:
+                    _log("（提醒：本次重新做了邮箱验证，说明「记住设备」没能免掉这次验证）")
                 return email_verify
             # 邮箱验证没自动完成，抛出明确错误（带 redirect 信息供下一步逆向）
-            raise LoginError("NEED_EMAIL_VERIFY", f"密码已通过但需邮箱验证码，redirect={redirect}")
+            raise LoginError(
+                "NEED_EMAIL_VERIFY",
+                f"密码已通过但需邮箱验证码，redirect={redirect}"
+                + ("，且设备记忆疑似已过期" if device_memory_expired else ""),
+                device_memory_expired=device_memory_expired,
+            )
 
         # 2FA
         if data and isinstance(data, dict) and data.get("need2FA"):
@@ -1617,7 +1946,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             cookie = cookies_to_string(page.context.cookies())
             if _auth_cookie_present(page.context.cookies()):
                 _log("2FA 登录成功")
-                return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
+                return _login_result(cookie, page.context.cookies(), username)
             raise LoginError("NEED_2FA", "2FA 验证未通过，请检查 TOTP 密钥是否正确")
 
         if isinstance(data, dict):

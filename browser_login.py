@@ -121,9 +121,22 @@ def _totp_for(user: str):
 
 
 def browser_login(site_config, user, pwd, headless=True):
-    """返回 cookie 字符串；失败返回 None。签名与主脚本里的调用保持一致。"""
+    """返回 cookie 字符串；失败返回 None。签名与主脚本里的调用保持一致。
+
+    另外提供 browser_login_detail()，返回带到期信息的完整 dict，
+    用于「主动续期」——需要知道 cookie 还能用几天。
+    """
+    r = browser_login_detail(site_config, user, pwd, headless)
+    return r.get("cookie") if r else None
+
+
+def browser_login_detail(site_config, user, pwd, headless=True):
+    """完整登录，返回 {cookie, expiry, cookie_life, device_memory_expired, error}。
+
+    失败时返回 dict（error 非空），不抛异常——调用方统一处理。
+    """
     if not user or not pwd:
-        return None
+        return {"error": "MISSING_CREDENTIALS"}
 
     # 本地模式默认“有头”（无头浏览器过不了 Cloudflare）；
     # 真的想无头就显式设 LOGIN_LOCAL_HEADLESS=true
@@ -145,12 +158,23 @@ def browser_login(site_config, user, pwd, headless=True):
             payload["totp_secret"] = totp_secret
         r = _post_json(f"{base}/login", payload, token=token)
         if r.get("ok") and r.get("cookie"):
-            print(f"[browser_login] {base} 登录成功（{r.get('cost', '?')}s）")
-            return r["cookie"]
+            print(f"[browser_login] {base} 登录成功（{r.get('cost', '?')}s）"
+                  f" 有效期={r.get('cookie_life', '?')}")
+            return {
+                "cookie": r["cookie"],
+                "expiry": r.get("expiry"),
+                "cookie_life": r.get("cookie_life"),
+                "device_memory_expired": bool(r.get("device_memory_expired")),
+            }
         errors.append(f"{base}: {r.get('error')} {r.get('message', '')}")
         print(f"[browser_login] {base} 登录失败：{r.get('error')} {r.get('message', '')}")
         if r.get("error") == "BAD_CREDENTIALS":
             # 密码错就没必要换机器重试了
+            break
+        if r.get("device_memory_expired"):
+            # 「这台设备之前登录过，这次仍要码」——设备记忆失效了。
+            # 继续换机器重试意义不大，直接把信号带出去让上层告警。
+            errors.append("设备记忆疑似已失效（这台机器之前登录过，本次仍要求邮箱验证）")
             break
 
     # ---------- B. 本地浏览器 ----------
@@ -167,18 +191,27 @@ def browser_login(site_config, user, pwd, headless=True):
                 proxy=os.getenv("AGENT_PROXY", ""),
             ) as page:
                 result = login_core.login(page, user, pwd, totp_secret=totp_secret)
-            print("[browser_login] 本地浏览器登录成功")
-            return result["cookie"]
+            print(f"[browser_login] 本地浏览器登录成功  有效期={result.get('cookie_life', '?')}")
+            return {
+                "cookie": result["cookie"],
+                "expiry": result.get("expiry"),
+                "cookie_life": result.get("cookie_life"),
+                "device_memory_expired": bool(result.get("device_memory_expired")),
+            }
         except Exception as e:
             # 这条以前只在有远程 agent 时才打印，导致单机模式下失败原因被完全吞掉
             code = getattr(e, "code", type(e).__name__)
             msg = getattr(e, "message", str(e))
+            dme = bool(getattr(e, "device_memory_expired", False))
             print(f"[browser_login] 本地浏览器登录失败 [{code}] {msg}")
             errors.append(f"local: {code} {msg}")
+            if dme:
+                errors.append("设备记忆疑似已失效（这台机器之前登录过，本次仍要求邮箱验证）")
+                return {"error": code, "message": msg, "device_memory_expired": True}
 
     if errors:
         print("[browser_login] 所有登录方式均失败：" + " | ".join(errors))
-    return None
+    return {"error": "LOGIN_FAILED", "message": " | ".join(errors)}
 
 
 def browser_sign(site_config, cookie=None):

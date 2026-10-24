@@ -26,12 +26,13 @@ except ImportError:
 
 # Playwright 浏览器登录
 try:
-    from browser_login import browser_login, browser_sign, PLAYWRIGHT_AVAILABLE
+    from browser_login import browser_login, browser_login_detail, browser_sign, PLAYWRIGHT_AVAILABLE
     if PLAYWRIGHT_AVAILABLE:
         print("成功加载 Playwright 浏览器登录模块")
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     browser_login = None
+    browser_login_detail = None
     browser_sign = None
 
 # 环境变量（显式指向脚本同目录的 .env，避免 cwd 不同读不到）
@@ -160,6 +161,89 @@ def load_cookies_from_file(site_name, account_index=None):
                 if content: return content
     except: pass
     return ""
+
+
+# === Cookie 到期元数据 ===
+#
+# 为什么需要：NodeSeek 的登录 cookie 约 30 天过期。等它掉了才发现要重登，
+# 很可能撞上「设备记忆也过期」→ 又要人工收邮箱验证码。
+# 所以登录成功时把到期时间记下来，快到期就主动换新，把风险窗口前移。
+_META_SUFFIX = ".meta.json"
+
+
+def get_cookie_meta_path(site_name, account_index=None):
+    path = get_cookie_file_path(site_name, account_index)
+    return os.path.splitext(path)[0] + _META_SUFFIX
+
+
+def save_cookie_meta(site_name, account_index, meta):
+    """记录 cookie 的到期信息。"""
+    try:
+        path = get_cookie_meta_path(site_name, account_index)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存cookie元数据失败: {e}")
+
+
+def load_cookie_meta(site_name, account_index=None):
+    try:
+        path = get_cookie_meta_path(site_name, account_index)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def cookie_days_left(meta) -> float:
+    """从元数据算出 cookie 还剩几天。返回 None 表示不知道（没记录过）。"""
+    if not meta:
+        return None
+    exp = meta.get("expiry", {}) if isinstance(meta.get("expiry"), dict) else {}
+    soonest = None
+    for name, info in exp.items():
+        if not isinstance(info, dict):
+            continue
+        d = info.get("days_left")
+        if d is None:
+            continue
+        if soonest is None or d < soonest:
+            soonest = d
+    if soonest is None:
+        return None
+    # 元数据是登录当时写的，隔了几天要扣掉
+    age = 0.0
+    ts = meta.get("ts")
+    if isinstance(ts, (int, float)):
+        age = max(0.0, (time.time() - ts) / 86400.0)
+    return soonest - age
+
+
+def should_renew_cookie(meta, threshold_days: float) -> bool:
+    """是否该提前换新 cookie。
+
+    规则（任一命中就换）：
+      · 剩不到 threshold_days 天      —— 快掉了，提前换
+      · 已经过期                       —— 肯定换
+      · 元数据显示是会话 cookie（关浏览器即失效）—— 换
+    元数据里没记录到期时间 → 不主动换（避免无谓的登录次数，
+    登录本身有风控成本，多次登录会被 RATE_LIMITED）。
+    """
+    if not meta:
+        return False
+    exp = meta.get("expiry", {}) if isinstance(meta.get("expiry"), dict) else {}
+    if not exp:
+        return False
+    # 全是会话 cookie → 每次跑都得重新登录，不如主动换
+    if all(isinstance(v, dict) and v.get("session_cookie") for v in exp.values()):
+        return True
+    d = cookie_days_left(meta)
+    if d is None:
+        return False
+    return d <= threshold_days
 
 
 def save_cookie_to_file(site_name, cookie_str, account_index=None):
@@ -501,23 +585,38 @@ def recover_cookie(site_name, site_config, account_index, user, pwd):
     x-captcha-token(Turnstile) + x-integrity-token(FingerprintJS) + x-security-token，
     后两者只能由真浏览器产生，CloudFreed 打码已经解决不了问题，所以它只作为
     显式开启的兜底（ALLOW_CLOUDFREED=true），默认完全不碰。
+
+    返回 (cookie, meta)：meta 里带 cookie 的到期信息，
+    用于「主动续期」——快到期时提前换新，别等 cookie 掉了才发现。
     """
-    if PLAYWRIGHT_AVAILABLE and browser_login:
+    meta = {}
+    if PLAYWRIGHT_AVAILABLE and browser_login_detail:
         print("尝试浏览器登录（本地 / 家宽 agent）...")
-        cookie = browser_login(site_config, user, pwd, headless=True)
+        r = browser_login_detail(site_config, user, pwd, headless=True)
+        cookie = (r or {}).get("cookie")
         if cookie:
             save_cookie_to_file(site_name, cookie, account_index)
-            return cookie
+            meta = {
+                # ts 必填：cookie_days_left() 用它扣掉「距上次登录过了多少天」
+                "ts": time.time(),
+                "expiry": r.get("expiry"),
+                "cookie_life": r.get("cookie_life"),
+                "device_memory_expired": bool(r.get("device_memory_expired")),
+            }
+            save_cookie_meta(site_name, account_index, meta)
+            return cookie, meta
         print("浏览器登录未成功")
+        if (r or {}).get("device_memory_expired"):
+            meta["device_memory_expired"] = True
 
     if os.getenv("ALLOW_CLOUDFREED", "").strip().lower() in ("1", "true", "yes"):
         print("尝试传统 API 登录（CloudFreed，已显式开启）...")
         cookie = auto_login(site_config, user, pwd)
         if cookie:
             save_cookie_to_file(site_name, cookie, account_index)
-            return cookie
+            return cookie, meta
 
-    return None
+    return None, meta
 
 
 def sign_failure_should_recover(status, msg):
@@ -557,6 +656,29 @@ def process_site(site_name, site_config, ns_random):
         print(f"\n--- 账号: {user} ---")
 
         cookie = load_account_cookie(site_name, site_config, idx)
+        meta = load_cookie_meta(site_name, idx)
+        renew_threshold = float(os.getenv("NS_RENEW_BEFORE_DAYS", "5") or 5)
+        device_memory_expired = False
+
+        # ---- 主动续期 ----
+        # NodeSeek 的登录 cookie 约 30 天过期。等它掉了才重登，很可能撞上
+        # 「设备记忆也过期」→ 又要人工收邮箱验证码。
+        # 所以：剩余寿命不足阈值时，提前主动换新一次。
+        # 换新用的还是同一个持久化 profile，NodeSeek 记得这台设备，
+        # 所以这一步不需要邮箱验证码。
+        if cookie and meta:
+            days = cookie_days_left(meta)
+            if days is not None:
+                print(f"Cookie 剩余寿命：{days:.1f} 天")
+                if should_renew_cookie(meta, renew_threshold):
+                    print(f"Cookie 不足 {renew_threshold} 天，主动续期…")
+                    new_cookie, new_meta = recover_cookie(site_name, site_config, idx, user, pwd)
+                    if new_cookie:
+                        cookie = new_cookie
+                        meta = new_meta or meta
+                        print("主动续期完成")
+                    else:
+                        print("主动续期失败，继续用现有 Cookie 尝试")
 
         if cookie:
             check_result = check_cookie_validity(site_config, cookie)
@@ -571,11 +693,21 @@ def process_site(site_name, site_config, ns_random):
             print("无可用Cookie，尝试登录...")
 
         if not cookie:
-            cookie = recover_cookie(site_name, site_config, idx, user, pwd)
+            cookie, meta = recover_cookie(site_name, site_config, idx, user, pwd)
+            device_memory_expired = bool(meta.get("device_memory_expired"))
 
         if not cookie:
             print("放弃: 无法获取有效Cookie")
-            site_results.append({'user': user, 'status': 'fail', 'msg': '登录失败'})
+            msg = "登录失败"
+            if device_memory_expired:
+                msg = ("登录失败：NodeSeek「记住设备」疑似已失效，"
+                       "这次仍要求邮箱验证码。请手动跑一次登录完成验证")
+            site_results.append({
+                'user': user,
+                'status': 'fail',
+                'msg': msg,
+                'device_memory_expired': device_memory_expired,
+            })
             continue
 
         status, msg = sign(cookie, site_config, ns_random)
@@ -583,9 +715,10 @@ def process_site(site_name, site_config, ns_random):
 
         if sign_failure_should_recover(status, msg):
             print("签到失败疑似Cookie不可用，尝试恢复登录后重试一次...")
-            new_cookie = recover_cookie(site_name, site_config, idx, user, pwd)
+            new_cookie, new_meta = recover_cookie(site_name, site_config, idx, user, pwd)
             if new_cookie:
                 cookie = new_cookie
+                device_memory_expired = bool(new_meta.get("device_memory_expired"))
                 status, msg = sign(cookie, site_config, ns_random)
                 print(f"重试签到结果: {msg}")
             else:
@@ -597,7 +730,39 @@ def process_site(site_name, site_config, ns_random):
             if stats:
                 print(f"统计: {stats['days']}天 | 总收益:{stats['total']} | 平均:{stats['avg']}")
 
-        site_results.append({'user': user, 'status': status, 'msg': msg, 'stats': stats})
+        site_results.append({
+            'user': user,
+            'status': status,
+            'msg': msg,
+            'stats': stats,
+            'device_memory_expired': device_memory_expired,
+        })
+
+    # === 设备记忆失效告警 ===
+    # 这是本项目最需要「立刻知道」的事件：
+    #   这台设备之前登录过 → NodeSeek 却仍要求邮箱验证码 → 说明「记住设备」失效了。
+    # 如果不告警，你可能连续几天签到失败都不知道原因。
+    # 用独立通道推送，不受「今日已通知过」的限制。
+    dme = [r for r in site_results if r.get('device_memory_expired')]
+    if dme:
+        lines = "\n".join(f"· {r['user']}：{r['msg']}" for r in dme)
+        alert = (
+            "⚠️ NodeSeek「记住设备」疑似已失效\n"
+            f"{lines}\n\n"
+            "这台设备之前登录过，这次仍被要求邮箱验证码。\n"
+            "含义：NodeSeek 侧的设备记忆过期了（或出口IP/浏览器指纹变了），\n"
+            "      以后每次 cookie 失效都可能要人工收码。\n\n"
+            "处理：\n"
+            "1) 手动跑一次登录完成邮箱验证，让它重新记住这台设备\n"
+            "   cd /root/nodeseek-autosign && .venv/bin/python multi_site_sign_cookie_only.py\n"
+            "2) 想要真正无人值守 → 配置自动收码（见部署指南「让验证码也自动化」）\n"
+            "3) 若怀疑是 IP/指纹变了 → 检查 AGENT_PROXY 是否变动"
+        )
+        print("⚠️ 检测到设备记忆失效，正在告警…")
+        try:
+            send("⚠️ NodeSeek 设备记忆失效", alert)
+        except Exception as e:
+            print(f"告警推送失败: {e}")
 
     # 发送通知
     if hadsend and should_send_notification(site_name):

@@ -181,22 +181,41 @@ def api_login():
         ) as page:
             result = login_core.login(page, username, password, totp_secret=totp_secret)
 
-        save_cookie(account, result["cookie"], {"username": username})
+        save_cookie(account, result["cookie"], {
+            "username": username,
+            # cookie 的到期信息：让上层能判断「还剩几天，要不要提前换新」，
+            # 而不是等 cookie 掉了才发现要重新登录。
+            "expiry": result.get("expiry"),
+            "cookie_life": result.get("cookie_life"),
+            "device_memory_expired": bool(result.get("device_memory_expired")),
+        })
         cost = round(time.time() - started, 1)
-        print(f"[login] 成功 {account} 用时 {cost}s cookie={result['cookie'][:60]}…", flush=True)
+        print(f"[login] 成功 {account} 用时 {cost}s "
+              f"cookie={result['cookie'][:60]}… "
+              f"有效期={result.get('cookie_life')}", flush=True)
         return jsonify({
             "ok": True,
             "account": account,
             "username": username,
             "cookie": result["cookie"],
+            "expiry": result.get("expiry"),
+            "cookie_life": result.get("cookie_life"),
+            "device_memory_expired": bool(result.get("device_memory_expired")),
             "cost": cost,
             "engine": resolve_engine(ENGINE),
         })
     except LoginError as e:
         print(f"[login] 失败 {account} {e.code} {e.message}", flush=True)
         code = 401 if e.code == "BAD_CREDENTIALS" else 424
-        return jsonify({"ok": False, "error": e.code, "message": e.message,
-                        "cost": round(time.time() - started, 1)}), code
+        # device_memory_expired=True 表示「这台设备之前登录过，
+        # 这次却仍被要求邮箱验证」——设备记忆失效了，上层要告警。
+        return jsonify({
+            "ok": False,
+            "error": e.code,
+            "message": e.message,
+            "device_memory_expired": bool(getattr(e, "device_memory_expired", False)),
+            "cost": round(time.time() - started, 1),
+        }), code
     except Exception as e:
         print(f"[login] 异常 {account} {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": "INTERNAL", "message": f"{type(e).__name__}: {e}"}), 500

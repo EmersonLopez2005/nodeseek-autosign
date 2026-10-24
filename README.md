@@ -37,6 +37,39 @@ python3 check_env.py
 
 它会查出口 IP 的 ASN、是不是机房 IP，然后真的打开登录页走一遍挑战，最后给结论。
 
+### 「每台新设备一次」——到底会不会变成「每 30 天一次」？
+
+第②层的邮箱验证码是本项目唯一需要人工的地方，它决定了项目有没有意义。事实是：
+
+| 事实 | 证据 |
+|---|---|
+| NodeSeek 会「记住设备」 | 管理员原话：「普通登录会记住用户设备，登陆过的设备不会要求邮箱验证」 |
+| 实测：同一 profile 第二次登录**免码** | 2026-10-24：23:09 走完邮箱验证 → 23:16 直接登录成功，没有验证码 |
+| 登录 cookie 约 30 天过期 | 社区实测：「按日期看登录后一个月就得失效了」 |
+| 30 天后重新登录还要不要码？ | **官方没承诺过** —— 所以项目不能靠"应该不会"来赌 |
+
+针对这最后一条，本项目做了两件事把不确定性消掉：
+
+**① 主动续期** —— 不等 cookie 掉。登录成功时记下每个 cookie 的到期时间，
+剩余寿命不足 5 天（`NS_RENEW_BEFORE_DAYS`）就**主动重新登录换新**。
+因为用的是同一个持久化 profile，NodeSeek 记得这台设备，这一步**不需要验证码**。
+→ cookie 永远不会「突然掉」，也就永远不会「突然要人工」。
+
+**② 设备记忆失效时立刻告警** —— 万一 NodeSeek 换了策略，脚本能分辨出这个信号
+（profile 里有登录痕迹却仍被要求验证码），立刻推 Telegram，并直接告诉你怎么办。
+→ 项目不会「静默失败好几天」。
+
+想自己实测这个结论，不用等 30 天：
+
+```bash
+python3 diagnose_device_memory.py status     # 看现状：记住了什么、还剩几天
+python3 diagnose_device_memory.py simulate   # 模拟 30 天后 cookie 过期，重新登录看要不要码
+```
+
+`simulate` 的结论直接决定要不要配自动收码：**要** → 按
+[部署指南 6.5 节](部署指南_账号密码自动登录.md)配 `NS_CODE_FILE` / `NS_CODE_URL` / `NS_IMAP_*`，
+脚本就能自己收验证码自己填，做到**真正无人值守**；**不要** → 现在这套就已经完全自动了。
+
 ---
 
 ## 二、资源占用（按「尽量小」设计）
@@ -92,6 +125,12 @@ vi .env            # NS_USER_PASS=用户名&密码
 
 # 跑一次（首次可能会问你要邮箱验证码，输一次就记住了这台设备）
 .venv/bin/python multi_site_sign_cookie_only.py
+
+# 确认「记住设备」生效了：看这台设备记住了什么、cookie 还剩几天
+.venv/bin/python diagnose_device_memory.py status
+
+# 想验证 30 天后 cookie 掉了还要不要人工（会删掉当前 cookie，测完重跑一次登录即可）
+.venv/bin/python diagnose_device_memory.py simulate
 ```
 
 跑通了再接定时任务：
@@ -104,8 +143,11 @@ vi .env            # NS_USER_PASS=用户名&密码
 
 > **无人值守的前提**：浏览器 profile 里已经记住了这台设备（第一次手动跑过一次登录）。
 > 之后日常签到只发两个 HTTP 请求，不开浏览器、不需要验证码。
-> 万一 cookie 过期触发重新登录，而服务器又要求邮箱验证码，定时任务会因为「非交互终端」
-> 拿不到验证码而失败 —— 看到日志里的 `当前不是交互式终端` 就手动跑一次登录即可。
+>
+> cookie 约 30 天过期，脚本会**提前 5 天主动换新**（`NS_RENEW_BEFORE_DAYS`），
+> 换新用的是同一个 profile，NodeSeek 记得这台设备 → 依然不需要验证码。
+> 万一设备记忆真的失效了，你会收到一条「⚠️ 设备记忆失效」的 Telegram 告警，
+> 里面直接写着该怎么做 —— 不会静默失败好几天。
 
 ### 青龙在 Docker 里（形态 B）
 
@@ -186,6 +228,11 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 | `AGENT_ENGINE` | auto | `patchright` / `camoufox` / `playwright` |
 | `AGENT_PROXY` | 空 | 给浏览器挂代理，如 `http://user:pass@host:port` |
 | `NS_TOTP_SECRET` | 空 | 账号开了 2FA 时填 Base32 密钥 |
+| `NS_RENEW_BEFORE_DAYS` | 5 | cookie 剩余寿命不足几天就主动换新（设 0 关闭） |
+| `NS_CODE_FILE` | 空 | 验证码落地文件路径（自动收码，不需要交出邮箱密码） |
+| `NS_CODE_URL` | 空 | HTTP 取码地址，返回纯文本验证码 |
+| `NS_IMAP_HOST` / `NS_IMAP_USER` / `NS_IMAP_PASS` | 空 | IMAP 自动收码（用邮箱授权码，不是登录密码） |
+| `NS_CODE_TIMEOUT` | 180 | 等验证码的最长秒数 |
 | `NS_RANDOM` | true | 签到时间随机抖动 |
 | `TG_BOT_TOKEN` / `TG_USER_ID` | 空 | Telegram 推送 |
 
@@ -215,6 +262,9 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 | `xvfb 相关报错` | 没装 Xvfb | `apt install -y xvfb`（install 脚本已装） |
 | 签到 403 但登录正常 | 签到这一步被 WAF 拦 | 用 `POST /sign` 让 agent 代签 |
 | 提示未配置 `CLOUDFREED_API_KEY` | 旧版遗留兜底逻辑 | 已修：默认不再调用 CloudFreed，不需要配 |
+| 收到「⚠️ 设备记忆失效」告警 | 这台设备之前登录过，这次仍要邮箱验证码 | NodeSeek 改了策略/你换了 IP。手动跑一次登录，再按[部署指南 6.5](部署指南_账号密码自动登录.md)配自动收码根治 |
+| 「当前不是交互式终端，无法手动输入验证码」 | cron 里跑且没配自动收码 | 配 `NS_CODE_FILE` / `NS_CODE_URL` / `NS_IMAP_*`（见部署指南 6.5） |
+| 想知道 30 天后要不要人工 | —— | `python3 diagnose_device_memory.py simulate` |
 
 更详细的部署说明见 [部署指南_账号密码自动登录.md](部署指南_账号密码自动登录.md)。
 
@@ -224,9 +274,10 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 ```
 .
-├── install_vps.sh                 一键安装（系统依赖 / Chromium / venv / systemd）
+├── install_vps.sh                 一键安装（系统依赖 / Camoufox / venv / systemd）
 ├── check_env.py                   VPS 体检：IP 类型 + 真实挑战测试
-├── multi_site_sign_cookie_only.py 主脚本：签到 + 登录恢复
+├── diagnose_device_memory.py      诊断：设备记忆还在不在（实测要不要验证码）
+├── multi_site_sign_cookie_only.py 主脚本：签到 + 主动续期 + 登录恢复
 ├── browser_login.py               登录适配层（远程 agent 优先，本地兜底）
 ├── notify.py                      通知（TG / 企业微信 / 钉钉 / Bark…）
 ├── nodeseek_cookie_sync.user.js   油猴脚本：浏览器 cookie 同步到青龙（可选）
@@ -234,12 +285,21 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 ├── 部署指南_账号密码自动登录.md    部署与排错详解
 ├── agent/
 │   ├── browser_engine.py          引擎适配 + 自动 Xvfb + 反检测参数
-│   ├── login_core.py              登录流程（挑战、Turnstile、表单、2FA）
+│   ├── login_core.py              登录流程（挑战、Turnstile、表单、2FA、自动收码）
 │   ├── nodeseek_login_agent.py    Flask 服务：/login /sign /cookie /health
 │   ├── Dockerfile
 │   └── docker-compose.yml
 ├── requirements.txt
 └── .env.example
+```
+
+运行时自动生成：
+
+```
+cookie/
+├── NODESEEK_COOKIE_1.txt          当前 cookie
+├── NODESEEK_COOKIE_1.meta.json    cookie 到期元数据（主动续期靠它判断）
+└── profiles/<账号>/               持久化浏览器 profile（记住设备的关键）
 ```
 
 ---
