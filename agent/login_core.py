@@ -443,46 +443,76 @@ def _dismiss_dialog(page):
 
 
 def _install_signin_interceptor(page):
-    """在页面里包一层 fetch，捕获 /api/account/signIn 的请求与响应体。
+    """在页面里同时包一层 fetch 和 XHR，捕获 /api/account/signIn 的请求与响应体。
 
     为什么要这么做：
-      登录是 NodeSeek 前端 JS 自己 fetch 的（token 在 JS 闭包里，header 也是前端加的），
+      登录是 NodeSeek 前端 JS 自己发的（token 在 JS 闭包里，header 也是前端加的），
       我们用 expect_response 只能拿到网络层响应，而 Camoufox（Firefox 内核）下读 body
       会报 NS_ERROR_INVALID_CONTENT_ENCODING，导致「登录失败：HTTP 200」这种看不出原因的错误。
 
-    这里直接在页面 JS 层 hook window.fetch，把 signIn 的请求头 + 响应原文记到
-    window.__ns_signin_debug 里，提交后读出来，就能看到接口到底回了什么
-    （token 无效 / 密码错误 / 需要 2FA / 账号不存在…）。
+      上一版只 hook 了 window.fetch，结果没捕获到 —— 说明前端登录走的是
+      XMLHttpRequest（或 axios 等内部持有原始 fetch 引用的库）。这里把 fetch 和
+      XHR 都 hook 住，无论前端用哪种方式发请求都能抓到响应原文。
     """
     page.evaluate(
         """() => {
             if (window.__ns_signin_hooked) return;
             window.__ns_signin_hooked = true;
             window.__ns_signin_debug = null;
-            const orig = window.fetch.bind(window);
-            window.fetch = async function(input, init) {
-                const url = typeof input === 'string' ? input : (input && input.url) || '';
-                const isSignIn = url.indexOf('/api/account/signIn') !== -1;
-                if (isSignIn) {
-                    try {
-                        const resp = await orig(input, init);
-                        const clone = resp.clone();
-                        let bodyText = '';
-                        try { bodyText = await clone.text(); } catch (e) { bodyText = 'READ_ERR:' + e.message; }
-                        window.__ns_signin_debug = {
-                            url: url,
-                            status: resp.status,
-                            reqHeaders: init && init.headers ? (typeof init.headers === 'object' && !(init.headers instanceof Headers) ? init.headers : Object.fromEntries(new Headers(init.headers).entries())) : null,
-                            respBody: bodyText.slice(0, 2000)
-                        };
-                        return resp;
-                    } catch (e) {
-                        window.__ns_signin_debug = { url: url, fetchErr: String(e && e.message || e) };
-                        throw e;
+
+            const isSignInUrl = (u) => u && u.indexOf('/api/account/signIn') !== -1;
+
+            // ---- 1) 拦截 fetch ----
+            try {
+                const origFetch = window.fetch.bind(window);
+                window.fetch = async function(input, init) {
+                    const url = typeof input === 'string' ? input : (input && input.url) || '';
+                    if (isSignInUrl(url)) {
+                        try {
+                            const resp = await origFetch(input, init);
+                            const clone = resp.clone();
+                            let bodyText = '';
+                            try { bodyText = await clone.text(); } catch (e) { bodyText = 'READ_ERR:' + e.message; }
+                            window.__ns_signin_debug = {
+                                via: 'fetch', url: url, status: resp.status,
+                                respBody: bodyText.slice(0, 3000)
+                            };
+                            return resp;
+                        } catch (e) {
+                            window.__ns_signin_debug = { via: 'fetch', url: url, fetchErr: String(e && e.message || e) };
+                            throw e;
+                        }
                     }
-                }
-                return orig(input, init);
-            };
+                    return origFetch(input, init);
+                };
+            } catch (e) {}
+
+            // ---- 2) 拦截 XMLHttpRequest ----
+            try {
+                const origOpen = XMLHttpRequest.prototype.open;
+                const origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__ns_url = url;
+                    return origOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    const xhr = this;
+                    if (isSignInUrl(xhr.__ns_url)) {
+                        xhr.addEventListener('load', function() {
+                            let bodyText = '';
+                            try { bodyText = xhr.responseText; } catch (e) { bodyText = 'READ_ERR:' + e.message; }
+                            window.__ns_signin_debug = {
+                                via: 'xhr', url: xhr.__ns_url, status: xhr.status,
+                                respBody: (bodyText || '').slice(0, 3000)
+                            };
+                        });
+                        xhr.addEventListener('error', function() {
+                            window.__ns_signin_debug = { via: 'xhr', url: xhr.__ns_url, xhrErr: 'network error' };
+                        });
+                    }
+                    return origSend.apply(this, arguments);
+                };
+            } catch (e) {}
         }"""
     )
 
@@ -681,7 +711,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             _log("登录成功（已拿到 sessionid）")
             return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
-        # 没有 sessionid：先读 fetch 拦截器捕获的接口原文，再看网络层响应兜底
+        # 没有 sessionid：先读 fetch/XHR 拦截器捕获的接口原文，再用网络层响应兜底
         debug = _read_signin_debug(page)
         status = None
         data = None
@@ -693,14 +723,39 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                     data = json.loads(body_text)
                 except Exception:
                     data = body_text
-            if debug.get("fetchErr"):
-                _log(f"signIn fetch 报错：{debug['fetchErr']}")
+            if debug.get("fetchErr") or debug.get("xhrErr"):
+                _log(f"signIn 请求报错：{debug.get('fetchErr') or debug.get('xhrErr')}")
+
+        # 兜底：拦截器没抓到（或抓到的是非 JSON）时，直接从 Playwright 响应对象读原始字节。
+        # Camoufox/Firefox 下 resp.json()/resp.text() 会报 NS_ERROR_INVALID_CONTENT_ENCODING，
+        # 但 resp.body() 拿的是原始字节，可以自己解码。
         if data is None and resp is not None:
+            status = resp.status
+            raw = None
             try:
-                status = resp.status
-                data = resp.json()
+                raw = resp.body()
+            except Exception as e:
+                _log(f"resp.body() 读取失败：{type(e).__name__}")
+            if raw:
+                for enc in ("utf-8", "gbk", "latin-1"):
+                    try:
+                        txt = raw.decode(enc)
+                        data = json.loads(txt)
+                        _log(f"响应体（{enc} 解码成功）：{txt[:500]}")
+                        break
+                    except Exception:
+                        continue
+                else:
+                    # 都不是合法 JSON，当作纯文本保留前 300 字节
+                    data = raw.decode("utf-8", errors="replace")[:300]
+                    _log(f"响应体非 JSON：{data}")
+            # 响应头也打出来，帮助判断 Content-Encoding / Set-Cookie 问题
+            try:
+                _log(f"响应头：content-type={resp.headers.get('content-type')} "
+                     f"content-encoding={resp.headers.get('content-encoding')} "
+                     f"set-cookie={resp.headers.get('set-cookie')}")
             except Exception:
-                data = None
+                pass
 
         # 2FA
         if data and isinstance(data, dict) and data.get("need2FA"):
