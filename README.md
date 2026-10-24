@@ -1,6 +1,6 @@
 # NodeSeek 多账号自动签到（浏览器登录版）
 
-NodeSeek / DeepFlood 多账号自动签到。Cookie 失效时用**真实浏览器**重新登录，不再依赖 CloudFreed 打码。
+NodeSeek 多账号自动签到。Cookie 失效时用**真实浏览器**重新登录，不再依赖 CloudFreed 打码。
 
 > 2026-10 起 NodeSeek 的登录接口增加了 Cloudflare Turnstile、FingerprintJS 指纹、`security_token` 三重校验，
 > 纯 HTTP 请求（含打码平台）已经无法登录。本项目改成「真浏览器登录 → 拿 cookie → 纯 HTTP 签到」，
@@ -201,6 +201,9 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 ├── multi_site_sign_cookie_only.py 主脚本：签到 + 登录恢复
 ├── browser_login.py               登录适配层（远程 agent 优先，本地兜底）
 ├── notify.py                      通知（TG / 企业微信 / 钉钉 / Bark…）
+├── nodeseek_cookie_sync.user.js   油猴脚本：浏览器 cookie 同步到青龙（可选）
+├── 使用说明_Cookie版本.md          Cookie 模式说明（可选路径）
+├── 部署指南_账号密码自动登录.md    部署与排错详解
 ├── agent/
 │   ├── browser_engine.py          引擎适配 + 自动 Xvfb + 反检测参数
 │   ├── login_core.py              登录流程（挑战、Turnstile、表单、2FA）

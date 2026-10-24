@@ -1,11 +1,10 @@
 // ==UserScript==
-// @name         NodeSeek / DeepFlood Cookie 同步到青龙
-// @namespace    https://github.com/local/ns-df-cookie-sync
-// @version      2.4.0
-// @description  抓取 NodeSeek / DeepFlood 登录 Cookie（含 HttpOnly、含父域 cf_clearance/session），以青龙远端值为基准按账号(uid)合并，跨浏览器不覆盖；登录态变化立即同步，否则每天保底自动同步一次
+// @name         NodeSeek Cookie 同步到青龙
+// @namespace    https://github.com/EmersonLopez2005/nodeseek-autosign
+// @version      2.5.0
+// @description  抓取 NodeSeek 登录 Cookie（含 HttpOnly、含父域 cf_clearance/session），以青龙远端值为基准按账号(uid)合并，跨浏览器不覆盖；登录态变化立即同步，否则每天保底自动同步一次
 // @author       you
 // @match        https://www.nodeseek.com/*
-// @match        https://www.deepflood.com/*
 // @grant        GM_cookie
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -23,7 +22,6 @@
   // ===== 站点配置 =====
   const SITES = {
     'www.nodeseek.com': { env: 'NS_COOKIE', label: 'NodeSeek' },
-    'www.deepflood.com': { env: 'DF_COOKIE', label: 'DeepFlood' },
   };
   const SITE = SITES[location.host];
   if (!SITE) return;

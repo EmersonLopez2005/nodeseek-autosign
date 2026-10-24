@@ -1,126 +1,82 @@
-# Cookie多账户签到脚本使用说明
+# Cookie 模式使用说明
 
-## 🎯 脚本特点
+> 这是可选路径。如果你已经配好了 `NS_USER_PASS`（账号密码 + 浏览器登录），
+> 完全可以不看这份文档 —— 脚本会自己处理 cookie 失效。
+>
+> 只有在下面两种情况才需要手工 cookie：
+> 1. 只想用 cookie、暂时不想装浏览器环境
+> 2. 账号开了 2FA 或邮箱验证，自动登录过不去
 
-**你只需要这一个脚本：`multi_site_sign_cookie_only.py`**
+## 两种模式的关系
 
-✅ **纯Cookie登录** - 无需账号密码，避免CF机器人检测  
-✅ **双站点支持** - 同时支持NodeSeek和DeepFlood  
-✅ **多账户管理** - 每个站点支持多个Cookie账户  
-✅ **通知优化** - 每天只发送一次汇总通知，不再频繁骚扰  
-✅ **简化配置** - 去掉复杂的验证码配置，只需要Cookie  
+```
+有 NS_COOKIE ──> 直接用 cookie 签到
+                    │
+                    └─ cookie 失效 ──> 用 NS_USER_PASS 走浏览器登录 ──> 拿到新 cookie
+                                          │
+                                          └─ 没配账号密码 ──> 跳过，提示更新 cookie
+```
 
-## 📋 环境变量配置
+cookie 只是「省掉登录这一步」，不是替代登录。论坛现在的风控下，
+纯手工 cookie 的有效期有限，长期跑还是要配账号密码。
 
-### 必需的环境变量
+## 配置
+
+### 单账号
 
 ```bash
-# NodeSeek站点Cookie（多个Cookie用&分隔）
-NS_COOKIE=cookie1&cookie2&cookie3
-
-# DeepFlood站点Cookie（多个Cookie用&分隔）  
-DF_COOKIE=cookie1&cookie2&cookie3
-
-# 可选配置
-NS_RANDOM=true
+NS_COOKIE=sessionid=abc123; cf_clearance=xyz; other=value
 ```
 
-### Cookie获取方法
+### 多账号
 
-1. **浏览器登录** 对应网站
-2. **F12打开开发者工具** → Network标签
-3. **手动签到一次** 或刷新页面
-4. **找到请求** → Headers → Cookie
-5. **复制完整Cookie值**
-
-### 多账户配置示例
+`&` 分隔，顺序对应 `NS_USER_PASS` 里的账号顺序：
 
 ```bash
-# 单账户
-NS_COOKIE=sessionid=abc123; csrftoken=def456; userid=789
-
-# 多账户（用&分隔）
-NS_COOKIE=sessionid=abc123; csrftoken=def456&sessionid=xyz789; csrftoken=uvw012
-
-# DeepFlood同理
-DF_COOKIE=sessionid=aaa111; csrftoken=bbb222&sessionid=ccc333; csrftoken=ddd444
+NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
 ```
 
-## 🚀 青龙面板配置
+### 同时配账号密码（推荐）
 
-### 1. 上传脚本
-将 `multi_site_sign_cookie_only.py` 上传到青龙面板脚本目录
-
-### 2. 配置环境变量
-在青龙面板环境变量中添加：
-- `NS_COOKIE` - NodeSeek的Cookie
-- `DF_COOKIE` - DeepFlood的Cookie  
-- `NS_RANDOM` - 设置为true（可选）
-
-### 3. 添加定时任务
 ```bash
-# 每天早上8:30执行
-30 8 * * * python3 /ql/scripts/multi_site_sign_cookie_only.py
+NS_USER_PASS=alice&pass1&bob&pass2
+NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
 ```
 
-## 📁 文件结构
+这样第一个账号用第一条 cookie，失效了用 `alice` 的密码登录；
+第二个账号同理。两边数量不必一致，脚本按序号取。
 
-```
-你的目录/
-├── multi_site_sign_cookie_only.py    # 主脚本（这一个就够了）
-└── cookie/                           # 自动创建的目录
-    └── notification_status.json      # 通知状态记录
-```
+## 怎么拿到 Cookie
 
-## 🔔 通知说明
+1. 浏览器登录 NodeSeek
+2. F12 → Application（应用）→ Cookies → `https://www.nodeseek.com`
+3. 至少要有 `sessionid`；有 `cf_clearance` 更好（有效期约 30 分钟到几小时）
 
-### 新的通知机制
-- **每天只发送一次** 汇总通知
-- **包含所有账户** 的签到结果
-- **详细统计信息** 包括近30天收益
+> `sessionid` 是 HttpOnly 的，在 Console 里 `document.cookie` 看不到，
+> 必须从 Application 面板或 Network 请求头里复制。
 
-### 通知内容示例
-```
-NodeSeek 签到汇总
-成功: 3 个账号
-失败: 0 个账号
+## 用油猴脚本自动同步（可选）
 
-账号1: 签到成功，获得 5 个鸡腿
-  近30天已签到25天，共获得125个鸡腿
+`nodeseek_cookie_sync.user.js` 可以把你浏览器里的 cookie 自动推到青龙环境变量，
+省掉手工复制：
 
-账号2: 签到成功，获得 3 个鸡腿  
-  近30天已签到23天，共获得98个鸡腿
+1. 装 Tampermonkey，导入这个脚本
+2. 脚本菜单里填青龙地址、Client ID、Client Secret
+3. 打开 NodeSeek，脚本会把 `NS_COOKIE` 合并写入青龙（按账号 uid 合并，不会覆盖其他账号）
 
-账号3: 签到成功，获得 4 个鸡腿
-  近30天已签到28天，共获得140个鸡腿
-```
+## 常见问题
 
-## ❓ 常见问题
+**Q: 只配 cookie 能长期跑吗？**
+A: 不能。`sessionid` 会过期，`cf_clearance` 更短。需要配 `NS_USER_PASS` 让脚本自动续。
 
-### Q: 只有这一个脚本就够了吗？
-**A: 是的！** `multi_site_sign_cookie_only.py` 这一个脚本就能处理两个站点的多账户签到。
+**Q: cookie 里包含 `&` 怎么办？**
+A: cookie 值里不会出现裸 `&`（都是 `;` 分隔），所以可以放心用 `&` 分隔多个账号。
 
-### Q: 需要配置验证码相关的环境变量吗？
-**A: 不需要！** 纯Cookie登录，无需 `SOLVER_TYPE`、`API_BASE_URL`、`CLIENTT_KEY` 等验证码配置。
+**Q: 签到返回 403 但 cookie 没过期？**
+A: 那是签到接口的 WAF 拦了出口 IP，不是 cookie 问题。用浏览器代签（`POST /sign`）或换 IP。
 
-### Q: Cookie过期了怎么办？
-**A: 手动更新Cookie** 到环境变量中即可，脚本会自动使用新Cookie。
+**Q: 环境变量里同时有 NS_COOKIE 和旧文件里的 cookie，用哪个？**
+A: 环境变量优先，避免旧文件覆盖你刚配的值。
 
-### Q: 如何知道Cookie是否有效？
-**A: 运行脚本后查看日志**，会显示每个账号的签到结果。
-
-### Q: 可以只签到一个站点吗？
-**A: 可以！** 只配置对应站点的Cookie环境变量即可：
-- 只要NodeSeek：只配置 `NS_COOKIE`
-- 只要DeepFlood：只配置 `DF_COOKIE`  
-- 两个都要：两个都配置
-
-## 🎉 优势总结
-
-1. **简单** - 只需要一个脚本文件
-2. **稳定** - 纯Cookie登录，避开CF检测
-3. **智能** - 自动处理多账户，汇总通知
-4. **灵活** - 支持单站点或双站点使用
-5. **清爽** - 每天只发一次通知，不再骚扰
-
-现在你可以删除其他复杂的脚本，只用这一个就够了！
+**Q: 怎么确认 cookie 还有效？**
+A: 跑一次脚本看日志，`签到成功` 就是有效；返回未登录会用账号密码自动重登。
