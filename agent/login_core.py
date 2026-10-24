@@ -522,6 +522,64 @@ def _signin_via_page_fetch(page, username: str, password: str):
         return None
 
 
+def _handle_email_verify(page, redirect: str, username: str):
+    """处理密码登录后的邮箱验证码二次确认。
+
+    NodeSeek 现在的登录是两步：密码验证通过后，redirect 到 emailSignIn.html
+    要求邮箱验证码。这里跳转到该页，dump 结构 + 抓接口线索。
+
+    当前为诊断版本：先 dump 出 emailSignIn 页面的输入框/按钮/接口线索，
+    为逆向验证码发送/提交接口做准备。若已配置邮箱 IMAP（NS_EMAIL +
+    NS_EMAIL_APP_PASSWORD），则尝试自动收验证码并提交。
+    """
+    url = redirect
+    if url.startswith("/"):
+        url = ORIGIN + url
+    _log(f"跳转到邮箱验证页：{url}")
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        _log(f"跳转邮箱验证页失败：{type(e).__name__}: {e}")
+        return None
+    page.wait_for_timeout(2500)
+    _dump_form_structure(page)
+
+    # 抓取页面里与验证码相关的接口线索（fetch 路径、axios 调用、表单 action）
+    try:
+        api_hints = page.evaluate(
+            """() => {
+                const hints = [];
+                // 1) 所有 script src
+                for (const s of document.querySelectorAll('script[src]')) {
+                    const src = s.getAttribute('src') || '';
+                    if (/email|sign|login|token|verify|code|account/i.test(src)) {
+                        hints.push('SCRIPT: ' + src);
+                    }
+                }
+                // 2) 表单
+                for (const f of document.querySelectorAll('form')) {
+                    hints.push('FORM: action=' + (f.getAttribute('action') || '') + ' method=' + (f.getAttribute('method') || ''));
+                }
+                // 3) 按钮文字
+                for (const b of document.querySelectorAll('button, [type=submit]')) {
+                    const t = (b.innerText || '').trim();
+                    if (t) hints.push('BTN: ' + t);
+                }
+                return hints.slice(0, 40);
+            }"""
+        )
+        if api_hints:
+            _log(f"邮箱验证页接口线索：{api_hints}")
+    except Exception as e:
+        _log(f"抓接口线索失败：{type(e).__name__}")
+
+    _debug_dump(page, "email_verify")
+
+    # TODO: 尝试自动收验证码（需 NS_EMAIL + NS_EMAIL_APP_PASSWORD）
+    # 当前先返回 None，让调用方抛出 NEED_EMAIL_VERIFY，下一步逆向接口后补齐。
+    return None
+
+
 def _install_signin_interceptor(page):
     """用 page.route 拦截 signIn 请求，去掉 Accept-Encoding: br，让响应体可读。
 
@@ -964,6 +1022,17 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                      f"set-cookie={resp.headers.get('set-cookie')}")
             except Exception:
                 pass
+
+        # 邮箱二次验证：密码登录成功（success:true）但返回 redirect 到 emailSignIn/smsSignIn，
+        # 说明账号或「新设备」需要邮箱验证码二次确认。这是登录流程的一部分，不是失败。
+        if data and isinstance(data, dict) and data.get("success") and data.get("redirect"):
+            redirect = data.get("redirect") or ""
+            _log(f"密码验证通过，但需要二次验证，redirect={redirect}")
+            email_verify = _handle_email_verify(page, redirect, username)
+            if email_verify:
+                return email_verify
+            # 邮箱验证没自动完成，抛出明确错误（带 redirect 信息供下一步逆向）
+            raise LoginError("NEED_EMAIL_VERIFY", f"密码已通过但需邮箱验证码，redirect={redirect}")
 
         # 2FA
         if data and isinstance(data, dict) and data.get("need2FA"):
