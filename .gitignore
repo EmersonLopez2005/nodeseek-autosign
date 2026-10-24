@@ -1,6 +1,28 @@
+# ---- 配置与密钥（绝对不能提交）----
+.env
+.env.*
+!.env.example
+*.tar.gz
+*.bak
+*.key
+*.pem
+
+# ---- Python ----
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+env/
 agent/.venv/
-agent/data/
+
+# ---- 运行时数据（cookie / 登录态 / 浏览器指纹）----
 cookie/
+data/
+logs/
+agent/data/
+
+# ---- 其它 ----
 node_modules/
+.DS_Store
+*.log

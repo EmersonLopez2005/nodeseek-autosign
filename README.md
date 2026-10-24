@@ -233,6 +233,8 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 ├── install_vps.sh                 一键安装（系统依赖 / Camoufox / venv / systemd）
 ├── check_env.py                   VPS 体检：IP 类型 + 真实挑战测试
 ├── diagnose_device_memory.py      诊断：设备记忆还在不在（要不要验证码）
+├── scan_secrets.py                密钥自查（提交前扫一遍）
+├── purge_secrets.sh               清 git 历史里的密钥
 ├── multi_site_sign_cookie_only.py 主脚本：签到 + 主动续期 + 登录恢复
 ├── browser_login.py               登录适配层（远程 agent 优先，本地兜底）
 ├── notify.py                      通知（TG / 企业微信 / 钉钉 / Bark…）
@@ -382,9 +384,66 @@ ls -d /opt/nodeseek-autosign ~/.cache/camoufox ~/.cache/ms-playwright 2>/dev/nul
 
 ---
 
-## 九、说明
+## 九、密钥泄露应急处理
+
+`.env` 已被 `.gitignore` 排除，正常操作不会泄露。但如果你手滑把密码或 token 提交上去了：
+
+### 第一步：立刻换掉凭据（最重要）
+
+**删代码不等于换密钥。** 已经推上去的凭据必须当作已泄露处理：
+
+| 凭据 | 去哪换 |
+|---|---|
+| Telegram Bot Token | 找 `@BotFather` → `/revoke` 吊销 → `/token` 重新生成 |
+| NodeSeek 密码 | 改密码；旧 cookie 同时作废 |
+| 钉钉/企微 webhook | 机器人后台删除重建 |
+| GitHub PAT | GitHub → Settings → Developer settings → 撤销 |
+
+### 第二步：自查
+
+```bash
+python3 scan_secrets.py            # 扫工作区
+python3 scan_secrets.py --staged   # 只扫已 git add 的
+python3 scan_secrets.py --history  # 连 git 历史一起扫（慢）
+```
+
+退出码 `0` = 干净，`1` = 发现疑似密钥。
+
+### 第三步：清历史（如果已经推上去了）
+
+```bash
+bash purge_secrets.sh --dry-run    # 先看会改什么
+bash purge_secrets.sh --yes        # 重写历史 + force push
+```
+
+会做四件事：备份 `.git` → 用 `filter-branch` 把历史里的敏感串替换成 `[REDACTED]`
+→ **删掉 `refs/original/*` 备份引用并 `gc` 回收对象**（不删的话旧对象照样能被 clone 拿到）
+→ 验证所有 ref 都搜不到后 force push。
+
+> force push 会改写所有 commit SHA。别的机器 clone 过的话要重新 clone 或 `git reset --hard origin/main`。
+
+### 第四步：关掉告警
+
+GitHub 仓库页 →「安全和质量」→「密钥扫描」→ 把告警标成「已解决」。
+
+### 建议：加个 pre-commit 钩子
+
+```bash
+cat > .git/hooks/pre-commit <<'EOF'
+#!/bin/sh
+python3 scan_secrets.py --staged || {
+  echo "❌ 检测到疑似密钥，提交被阻止"
+  exit 1
+}
+EOF
+chmod +x .git/hooks/pre-commit
+```
+
+---
+
+## 十、说明
 
 - 本工具只做「自动点击签到」，不刷帖、不刷积分、不做任何互动行为。
 - 请遵守 NodeSeek 的站点规则；账号因自动化被封与本项目无关。
 - 密码保存在本地 `.env`，注意文件权限（`chmod 600 .env`），不要提交到仓库。
-- `.gitignore` 已排除 `.env`、`cookie/`、`data/`、`.venv/`。
+- `.gitignore` 已排除 `.env`、`cookie/`、`data/`、`logs/`、`.venv/`。
