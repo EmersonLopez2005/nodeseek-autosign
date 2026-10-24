@@ -268,7 +268,12 @@ def check_challenge(url, headless, wait=45):
             tok = None
             state = "unknown"
             last_state = None
-            for _ in range(12):
+            # 只点一次：Turnstile 计算期间重复点击会取消验证重新开始。
+            # 先静默等 8 秒（托管模式常常自动过），再点一次，然后等 22 秒。
+            deadline = time.time() + 30
+            ts_start = time.time()
+            clicked = False
+            while time.time() < deadline:
                 tok = login_core._turnstile_token(page)
                 state = login_core.turnstile_state(page)
                 if state != last_state:
@@ -281,8 +286,10 @@ def check_challenge(url, headless, wait=45):
                     last_state = state
                 if tok or state in ("success", "error"):
                     break
-                login_core._click_turnstile_checkbox(page)
-                page.wait_for_timeout(2500)
+                if (not clicked) and state == "pending" and (time.time() - ts_start) > 8:
+                    login_core._click_turnstile_checkbox(page)
+                    clicked = True
+                page.wait_for_timeout(1000)
 
             if tok:
                 say(OK, f"Turnstile token：已获取（{len(tok)} 字符）")
@@ -295,8 +302,11 @@ def check_challenge(url, headless, wait=45):
             elif state == "error":
                 say(BAD, "Turnstile 组件报错（验证失败）—— 组件本身的网络/风控问题")
                 results["challenge"] = "widget_error"
+            elif state == "verifying":
+                say(WARN, "Turnstile 组件：还在转圈计算（30s 没算完，通常是被风控降分）")
+                results["challenge"] = "pending"
             elif state == "pending" and box:
-                say(WARN, "Turnstile 组件：一直停在待验证状态（点击没生效，或需要人工做图像题）")
+                say(WARN, "Turnstile 组件：停在待验证状态（点击没生效，或需要人工做图像题）")
                 results["challenge"] = "pending"
             elif box:
                 say(WARN, "Turnstile 组件：定位到但读不到状态")

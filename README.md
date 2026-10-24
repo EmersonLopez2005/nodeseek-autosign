@@ -192,12 +192,14 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 |---|---|---|
 | 卡在 "Just a moment" | IP 被 CF 判高风险 | 换 IP 或挂住宅代理，换引擎没用 |
 | 页面弹「人机验证服务加载失败」 | 无头模式 / 点错了隐藏元素 | 用有头（默认），代码已改成坐标点击 |
+| 日志里 `Turnstile 组件状态：verifying` 卡 30 秒 | 组件在转圈计算，期间被重复点击会取消重来 | 已修：现在只点 1~2 次，间隔 ≥15 秒。若仍卡住说明 IP 评分不够 |
 | `TURNSTILE_NETWORK` | 访问不到 `challenges.cloudflare.com` | 检查 DNS / 出网，机房 IP 常见 |
 | `BAD_CREDENTIALS` | 密码错，或需要邮箱验证 | 先手动网页登录一次 |
 | `NEED_2FA` | 账号开了两步验证 | 配 `NS_TOTP_SECRET` |
 | `PAGE_ERROR` | 站点改版，选择器失效 | 看 `data/debug_login_page.png`，改 `agent/login_core.py` |
 | `xvfb 相关报错` | 没装 Xvfb | `apt install -y xvfb`（install 脚本已装） |
 | 签到 403 但登录正常 | 签到这一步被 WAF 拦 | 用 `POST /sign` 让 agent 代签 |
+| 提示未配置 `CLOUDFREED_API_KEY` | 旧版遗留兜底逻辑 | 已修：默认不再调用 CloudFreed，不需要配 |
 
 更详细的部署说明见 [部署指南_账号密码自动登录.md](部署指南_账号密码自动登录.md)。
 

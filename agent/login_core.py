@@ -124,13 +124,19 @@ def _challenge_cleared(page) -> bool:
         return False
 
 
-def _wait_out_challenge(page, timeout=45):
-    """如果遇到整页 CF 挑战，点复选框并等它过（家宽 IP 通常几秒就过）。"""
+def _wait_out_challenge(page, timeout=50):
+    """遇到整页 CF 挑战时等它自己过。
+
+    注意：整页挑战的 Turnstile 同样是「点一次 → 转圈计算 → 放行」。
+    计算期间重复点击会取消当前验证重新开始，等于永远过不去，
+    所以这里最多点 2 次，间隔 20 秒。
+    """
     if not _page_is_challenge(page):
         return True
     _log("检测到 Cloudflare 整页挑战，等待自动通过…")
     deadline = time.time() + timeout
-    last_click = 0
+    clicked = 0
+    last_click = 0.0
     stable = 0
     while time.time() < deadline:
         page.wait_for_timeout(1500)
@@ -139,13 +145,16 @@ def _wait_out_challenge(page, timeout=45):
             if stable >= 2:
                 _log("整页挑战已通过")
                 return True
-        else:
-            stable = 0
-            if not _page_is_challenge(page):
-                # 既不是挑战页、也没加载出正式页面，多半在跳转中
-                page.wait_for_timeout(1000)
-        if time.time() - last_click > 6:
+            continue
+        stable = 0
+        if not _page_is_challenge(page):
+            # 既不是挑战页、也没加载出正式页面，多半在跳转中
+            page.wait_for_timeout(1000)
+            continue
+        # 只在前 20 秒内补点，避免打断正在进行的验证
+        if clicked < 2 and time.time() - last_click > 20:
             _click_turnstile_checkbox(page)
+            clicked += 1
             last_click = time.time()
     _log(f"整页挑战 {timeout} 秒未通过")
     return False
@@ -216,34 +225,81 @@ def _click_turnstile_checkbox(page) -> bool:
     return False
 
 
-def _wait_turnstile(page, timeout=30):
-    """等 Turnstile 出 token。登录页的组件是交互式的，必须先点复选框。
+def _wait_turnstile(page, timeout=40):
+    """等 Turnstile 完成验证。
 
-    每 4 秒重点一次，直到出 token 或超时。
+    实测教训（2026-10，AT&T 住宅 IP）：
+      点完复选框后组件会转圈计算 3~15 秒，这段时间内**再点一次会取消并重新开始**。
+      旧版每 4 秒点一次，30 秒点 7 次，结果永远停在转圈。
+      所以这里：先静默等 8 秒（托管模式常常自动通过，压根不用点），
+      没动静才点 1 次，之后只轮询不再点击。
+
+    返回 token / "widget-ok"；拿不到明确信号返回 None（交给提交结果判断）。
     """
-    deadline = time.time() + timeout
-    last_click = 0
+    start = time.time()
+    deadline = start + timeout
+    clicked = 0
+    last_click = 0.0
+    last_state = None
+
     while time.time() < deadline:
         tok = _turnstile_token(page)
         if tok:
             _log(f"Turnstile token 已获取（{len(tok)} 字符）")
             return tok
+
+        state = turnstile_state(page)
+        if state == "success":
+            _log(f"Turnstile 组件已通过（{time.time() - start:.0f}s）")
+            return "widget-ok"
+        if state != last_state:
+            _log(f"Turnstile 组件状态：{state}")
+            last_state = state
+        if state == "error":
+            _log("Turnstile 报错，等 3 秒后重试一次")
+            page.wait_for_timeout(3000)
+            if clicked < 2:
+                _click_turnstile_checkbox(page)
+                clicked += 1
+                last_click = time.time()
+            page.wait_for_timeout(1000)
+            continue
+
         if "人机验证服务加载失败" in _body_text(page):
             raise LoginError(
                 "TURNSTILE_NETWORK",
                 "Turnstile 组件加载失败：这台机器访问不到 challenges.cloudflare.com，"
                 "请检查出口网络/DNS（家宽直连一般没问题，机房或代理可能被墙）",
             )
-        if _turnstile_widget_ok(page):
-            # 组件显示“验证成功”即说明 token 已交给页面（很多实现不写 hidden input）
-            _log("Turnstile 组件显示已验证，直接提交")
-            return "widget-ok"
-        if time.time() - last_click > 4:
+
+        elapsed = time.time() - start
+        # 8 秒内不点，给托管模式自动通过的机会；
+        # 只有在「明确还没开始验证」（pending）时才点，verifying 期间绝不动
+        if (state == "pending" and elapsed > 8 and clicked < 2
+                and time.time() - last_click > 15):
             _click_turnstile_checkbox(page)
+            clicked += 1
             last_click = time.time()
+
         page.wait_for_timeout(800)
-    _log(f"Turnstile {timeout} 秒内未出 token，尝试直接提交")
+
+    _log(f"Turnstile {timeout} 秒内没拿到明确信号，直接提交看接口怎么说")
     return None
+
+
+def _reload_login_page(page):
+    """重新加载登录页，拿到一个新的用户名输入框。
+
+    重试时必须走“整页刷新”而不是原地再点：Turnstile 的验证态绑在页面实例上，
+    原地重试会沿用已经失效的组件，表现为反复转圈。
+    """
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    _wait_out_challenge(page)
+    page.wait_for_timeout(1500)
+    loc = _first_visible(page, USERNAME_SELECTORS, timeout=8000)
+    if loc is None:
+        raise LoginError("PAGE_ERROR", "重新加载后登录表单没出现（站点改版或被风控）")
+    return loc
 
 
 def _dismiss_dialog(page):
@@ -267,39 +323,54 @@ def _body_text(page) -> str:
 
 
 def turnstile_state(page) -> str:
-    """Turnstile 组件当前状态：success / pending / error / unknown。
+    """Turnstile 组件当前状态：success / verifying / pending / error / unknown。
 
     为什么要判状态而不是判 token：
       NodeSeek 走的是 Turnstile 的 callback 模式，token 只存在页面 JS 变量里，
       不会写进 input[name="cf-turnstile-response"]。
       所以「读不到 token」是正常的，不代表验证失败。
+
+    verifying 表示正在转圈计算，此时**绝对不能再点**，点了会重新开始。
     """
     found = False
     for fr in page.frames:
         if "challenges.cloudflare.com" not in (fr.url or ""):
             continue
         found = True
-        checked = None
         try:
-            checked = fr.evaluate(
+            probe = fr.evaluate(
                 """() => {
-                    const cb = document.querySelector('input[type="checkbox"]');
-                    return cb ? !!cb.checked : null;
+                    const q = (s) => document.querySelector(s);
+                    const cb = q('input[type="checkbox"]');
+                    const text = (document.body && document.body.innerText || '').trim();
+                    // 成功时组件会渲染 #success 或勾号 svg，checkbox 随之消失
+                    const hasSuccess = !!(q('#success, .success, [id*="success"], [class*="success"]'));
+                    // 转圈计算中：有 spinner / 没有 checkbox 且没有 success
+                    const hasSpinner = !!(q('.spinner, [class*="spinner"], [class*="loading"], svg circle'));
+                    return {
+                        checked: cb ? !!cb.checked : null,
+                        hasCb: !!cb,
+                        hasSuccess,
+                        hasSpinner,
+                        text,
+                    };
                 }"""
             )
         except Exception:
-            checked = None
-        if checked:
+            continue
+
+        if probe.get("checked"):
             return "success"
-        try:
-            text = (fr.locator("body").inner_text() or "").strip()
-        except Exception:
-            text = ""
+        if probe.get("hasSuccess"):
+            return "success"
+        text = (probe.get("text") or "")
         low = text.lower()
         if any(k in low for k in ("error", "failed", "无法", "失败", "重试", "retry")):
             return "error"
         if any(k in low for k in ("成功", "success", "verified", "验证通过")):
             return "success"
+        if probe.get("hasSpinner") or not probe.get("hasCb"):
+            return "verifying"
     return "pending" if found else "unknown"
 
 
@@ -382,7 +453,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 loc.fill(value)
             page.wait_for_timeout(random.randint(200, 500))
 
-        _wait_turnstile(page, timeout=30)
+        _wait_turnstile(page, timeout=40)
 
         submit = _first_visible(page, SUBMIT_SELECTORS, timeout=5000)
         if submit is None:
@@ -397,9 +468,11 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         except Exception as e:
             last_msg = f"提交后未拿到接口响应（{type(e).__name__}）"
             _log(last_msg)
-            # 可能是 Turnstile 还在算，或页面弹了验证框
-            _click_turnstile_checkbox(page)
-            page.wait_for_timeout(3000)
+            # 多半是 Turnstile 还没算完，按钮提交被前端拦住。
+            # 不要原地重复点复选框（会取消验证），重新加载页面从头来一次。
+            if attempt < max_attempts:
+                _log("重新加载登录页后重试")
+                user_input = _reload_login_page(page)
             continue
 
         try:
@@ -458,6 +531,9 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             raise LoginError("BAD_CREDENTIALS", last_msg)
         if any(k in last_msg for k in ["验证", "人机", "captcha", "稍后", "频繁", "重试"]):
             page.wait_for_timeout(random.randint(3000, 5000))
+            if attempt < max_attempts:
+                _log("验证类失败，重新加载登录页重试")
+                user_input = _reload_login_page(page)
             continue
         raise LoginError("LOGIN_FAILED", last_msg)
 

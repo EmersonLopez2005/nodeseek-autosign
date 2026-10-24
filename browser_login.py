@@ -170,8 +170,11 @@ def browser_login(site_config, user, pwd, headless=True):
             print("[browser_login] 本地浏览器登录成功")
             return result["cookie"]
         except Exception as e:
-            if _agent_urls():
-                print(f"[browser_login] 本地兜底失败：{type(e).__name__}: {e}")
+            # 这条以前只在有远程 agent 时才打印，导致单机模式下失败原因被完全吞掉
+            code = getattr(e, "code", type(e).__name__)
+            msg = getattr(e, "message", str(e))
+            print(f"[browser_login] 本地浏览器登录失败 [{code}] {msg}")
+            errors.append(f"local: {code} {msg}")
 
     if errors:
         print("[browser_login] 所有登录方式均失败：" + " | ".join(errors))

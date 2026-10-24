@@ -311,7 +311,7 @@ def auto_login(site_config, username, password):
         api_key = os.getenv("CLOUDFREED_API_KEY", "")
         base_url = os.getenv("CLOUDFREED_BASE_URL", "http://localhost:3000")
         if not api_key:
-            print("错误：未配置 CLOUDFREED_API_KEY")
+            print("已开启 ALLOW_CLOUDFREED，但未配置 CLOUDFREED_API_KEY，跳过")
             return None
 
         solver = TurnstileSolver(api_base_url=base_url, client_key=api_key)
@@ -495,24 +495,27 @@ def load_account_cookie(site_name, site_config, account_index):
 
 
 def recover_cookie(site_name, site_config, account_index, user, pwd):
-    """恢复登录。顺序：家宽浏览器(agent/本地) → 传统 CloudFreed API 登录。
+    """恢复登录。默认只用浏览器（本机或家宽 agent）。
 
     2026-10 起 NodeSeek 的 /api/account/signIn 需要
     x-captcha-token(Turnstile) + x-integrity-token(FingerprintJS) + x-security-token，
-    后两者只能由真浏览器产生，所以浏览器方案放在第一位。
+    后两者只能由真浏览器产生，CloudFreed 打码已经解决不了问题，所以它只作为
+    显式开启的兜底（ALLOW_CLOUDFREED=true），默认完全不碰。
     """
     if PLAYWRIGHT_AVAILABLE and browser_login:
-        print("尝试通过浏览器登录（家宽 agent / 本地浏览器）...")
+        print("尝试浏览器登录（本地 / 家宽 agent）...")
         cookie = browser_login(site_config, user, pwd, headless=True)
         if cookie:
             save_cookie_to_file(site_name, cookie, account_index)
             return cookie
-        print("浏览器登录未成功，尝试传统 API 登录（CloudFreed）...")
+        print("浏览器登录未成功")
 
-    cookie = auto_login(site_config, user, pwd)
-    if cookie:
-        save_cookie_to_file(site_name, cookie, account_index)
-        return cookie
+    if os.getenv("ALLOW_CLOUDFREED", "").strip().lower() in ("1", "true", "yes"):
+        print("尝试传统 API 登录（CloudFreed，已显式开启）...")
+        cookie = auto_login(site_config, user, pwd)
+        if cookie:
+            save_cookie_to_file(site_name, cookie, account_index)
+            return cookie
 
     return None
 
