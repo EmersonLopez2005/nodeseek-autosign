@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.purge-secrets.local
 *.tar.gz
 *.bak
 *.key

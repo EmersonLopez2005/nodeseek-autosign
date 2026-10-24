@@ -124,6 +124,13 @@ def scan_history(hits: list):
 
     用 `git grep -P`（PCRE），不能用 `-E`：POSIX ERE 不支持 \\b 单词边界，
     会导致 Telegram token 这类规则静默失配（踩过这个坑）。
+
+    两个参数陷阱（都踩过）：
+      1. 多模式必须每个都带 `-e`。写成 `git grep -P pat1 pat2 rev` 会把 pat2
+         当成 revision 解析而直接报错。
+      2. rev 后面**不能**跟 `--`。`git grep -P -e pat -- rev` 会把 rev 当成
+         路径限定符，搜不到任何东西却不报错 —— 静默假阴性，最危险的一种。
+         正确形式：`git grep -P -e pat1 -e pat2 rev`。
     如果 git 没编译 PCRE，自动退回逐 commit 用 Python 正则扫。
     """
     try:
@@ -139,7 +146,8 @@ def scan_history(hits: list):
     for rev in revs:
         try:
             cmd = ["git", "grep", "-I", "-n", "-P"]
-            cmd += [p.pattern for _, p, _ in RULES]
+            for _, pat, _lvl in RULES:
+                cmd += ["-e", pat.pattern]
             cmd.append(rev)
             res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
             if res.returncode not in (0, 1):
