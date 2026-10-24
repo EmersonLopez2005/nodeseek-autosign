@@ -25,7 +25,7 @@ cookie 只是「省掉登录这一步」，不是替代登录。论坛现在的�
 ### 单账号
 
 ```bash
-NS_COOKIE=sessionid=abc123; cf_clearance=xyz; other=value
+NS_COOKIE=session=abc123; pjwt=eyJhbGciOi...; cf_clearance=xyz
 ```
 
 ### 多账号
@@ -33,14 +33,14 @@ NS_COOKIE=sessionid=abc123; cf_clearance=xyz; other=value
 `&` 分隔，顺序对应 `NS_USER_PASS` 里的账号顺序：
 
 ```bash
-NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
+NS_COOKIE=session=aaa; pjwt=aaa.jwt; cf_clearance=bbb&session=ccc; pjwt=ccc.jwt; cf_clearance=ddd
 ```
 
 ### 同时配账号密码（推荐）
 
 ```bash
 NS_USER_PASS=alice&pass1&bob&pass2
-NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
+NS_COOKIE=session=aaa; pjwt=aaa.jwt; cf_clearance=bbb&session=ccc; pjwt=ccc.jwt; cf_clearance=ddd
 ```
 
 这样第一个账号用第一条 cookie，失效了用 `alice` 的密码登录；
@@ -50,10 +50,11 @@ NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
 
 1. 浏览器登录 NodeSeek
 2. F12 → Application（应用）→ Cookies → `https://www.nodeseek.com`
-3. 至少要有 `sessionid`；有 `cf_clearance` 更好（有效期约 30 分钟到几小时）
+3. 至少要有 `session`（服务端会话）和 `pjwt`（登录 JWT）；有 `cf_clearance` 更好（有效期约 30 分钟到几小时）
 
-> `sessionid` 是 HttpOnly 的，在 Console 里 `document.cookie` 看不到，
-> 必须从 Application 面板或 Network 请求头里复制。
+> **实测更正（2026-10）**：早期文档写的 `sessionid` 这个名字在现在的站点上**并不存在**，
+> 登录成功后拿到的是 `session` + `pjwt` + `smac`。
+> 脚本判定「已登录」看的就是这几个字段，所以 cookie 里没有 `sessionid` 是正常的。
 
 ## 用油猴脚本自动同步（可选）
 
@@ -67,7 +68,7 @@ NS_COOKIE=sessionid=aaa; cf_clearance=bbb&sessionid=ccc; cf_clearance=ddd
 ## 常见问题
 
 **Q: 只配 cookie 能长期跑吗？**
-A: 不能。`sessionid` 会过期，`cf_clearance` 更短。需要配 `NS_USER_PASS` 让脚本自动续。
+A: 不能。`session` / `pjwt` 会过期，`cf_clearance` 更短。需要配 `NS_USER_PASS` 让脚本自动续。
 
 **Q: cookie 里包含 `&` 怎么办？**
 A: cookie 值里不会出现裸 `&`（都是 `;` 分隔），所以可以放心用 `&` 分隔多个账号。

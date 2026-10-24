@@ -150,7 +150,7 @@ LOGIN_AGENT_URLS=http://ip1:3000,http://ip2:3000,http://ip3:3000
 
 ```bash
 NS_USER=alice&bob            # 配合 NS_PASS=pass1&pass2
-NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
+NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 ```
 
 有 cookie 就先用 cookie，失效了才去登录。

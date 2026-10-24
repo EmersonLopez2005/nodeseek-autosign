@@ -53,6 +53,17 @@ SUBMIT_SELECTORS = [
     "button:has-text('登 录')",
 ]
 
+# NodeSeek 真实的登录态 cookie 名（2026-10 实测登录成功后浏览器里拿到的是
+# pjwt / session / smac，而不是早期文档里写的 sessionid）。
+#
+# 这一条踩过坑：邮箱验证码流程其实**已经登录成功**（cookie 里有 session+pjwt，
+# 页面也跳回了首页），但代码只认 "sessionid="，于是把成功误判成失败，
+# 白白重跑一遍邮箱验证。
+AUTH_COOKIE_NAMES = ("pjwt", "session", "smac")
+
+# 站内「必须登录才能访问」的接口，用它来确认登录态（比看 cookie 名可靠）
+AUTH_PROBE_API = "/api/account/credit/page-1"
+
 
 class LoginError(Exception):
     """带错误码的登录异常，方便上游区分是“要重试”还是“要人工介入”。"""
@@ -676,6 +687,10 @@ def _handle_email_verify(page, redirect: str, username: str):
     else:
         _log("该页没有 Turnstile 组件，直接发码")
 
+    # 1b) 装 API 记录器：提交验证码后，服务器到底回什么（成功/验证码错误），
+    #     只有原文说了算——页面读 br 压缩响应体会失败，页面 JS 里读不会。
+    _install_api_logger(page)
+
     # 2) 点「发送验证码」按钮，让 NodeSeek 向绑定邮箱发码
     #    用坐标点击（和 Turnstile 复选框一样），因为 locator.click() 在 Camoufox
     #    下可能点到被遮挡/隐藏元素，导致「已点击」但实际没触发发信。
@@ -758,6 +773,11 @@ def _handle_email_verify(page, redirect: str, username: str):
     _log("=" * 50)
     try:
         code = input("请输入邮箱验证码：").strip()
+    except EOFError:
+        _log("当前不是交互式终端（cron / 管道），无法手动输入验证码。")
+        _log("提示：验证码只用来「记住这台设备」一次——在终端里跑一次，"
+             "profile 记住设备后，后续密码登录就不再需要验证码。")
+        return None
     except Exception:
         code = ""
     if not code:
@@ -861,20 +881,61 @@ def _handle_email_verify(page, redirect: str, username: str):
         except Exception:
             pass
 
-    # 7) 等页面跳转，检查 sessionid
-    page.wait_for_timeout(3500)
-    all_cookies = page.context.cookies()
-    cookie = cookies_to_string(all_cookies)
+    # 7) 等页面跳转 + cookie 落库（最多 30 秒）
+    #    判据：拿到登录态 cookie（pjwt / session+smac）。
+    #    「跳回首页」只作为提示信号，最终仍以登录态 cookie + 站内接口为准。
+    deadline = time.time() + 30
+    all_cookies = []
+    cookie = ""
+    auth_ok = False
+    left_email_page = False
+    while time.time() < deadline:
+        page.wait_for_timeout(1000)
+        all_cookies = page.context.cookies()
+        cookie = cookies_to_string(all_cookies)
+        url_now = ""
+        try:
+            url_now = page.url or ""
+        except Exception:
+            pass
+        if _auth_cookie_present(all_cookies):
+            auth_ok = True
+            break
+        if url_now and "emailSignIn" not in url_now:
+            left_email_page = True
+
     _log(f"邮箱验证后 cookie 一览：{[c['name'] for c in all_cookies]}")
-    if "sessionid=" in cookie:
-        _log("邮箱验证登录成功（已拿到 sessionid）")
+    _log(f"当前 URL：{page.url if hasattr(page, 'url') else '?'}")
+    if auth_ok:
+        # 再用一次真实接口确认（cookie 名可能变，接口不会骗人）
+        verified = _verify_authenticated(page)
+        if verified is False:
+            _log("⚠️ cookie 看起来像登录态，但站内接口返回未登录 → 本次验证没生效")
+        elif verified is True:
+            _log("站内接口已确认：登录成功")
+        else:
+            _log("站内接口没能确认登录态（可能网络/风控），按 cookie 判定成功")
+        _log("邮箱验证登录成功")
         return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
-    # 没拿到 sessionid，从页面读错误提示
+    if left_email_page:
+        _log("页面已离开 emailSignIn，但没抓到登录态 cookie，再探一次接口…")
+        verified = _verify_authenticated(page)
+        if verified is True:
+            all_cookies = page.context.cookies()
+            cookie = cookies_to_string(all_cookies)
+            _log(f"接口确认已登录，cookie 一览：{[c['name'] for c in all_cookies]}")
+            return {"cookie": cookie, "cookies": all_cookies, "username": username}
+
+    # 没拿到登录态：把服务器原文打出来，看它到底说了什么
+    api_log = _read_api_log(page)
+    if api_log:
+        _log("邮箱验证相关的接口响应：")
+        for item in api_log[-6:]:
+            _log(f"  ↳ {item.get('url')} status={item.get('status')} body={item.get('body')}")
     err = _read_login_error(page)
     if err:
         _log(f"邮箱验证未通过：{err}")
-    _log(f"当前 URL：{page.url if hasattr(page, 'url') else '?'}")
     _debug_dump(page, "email_verify_failed")
     return None
 
@@ -1085,12 +1146,162 @@ def cookies_to_string(cookies, domain_hint="nodeseek.com") -> str:
         if domain_hint and domain_hint not in dom:
             continue
         picked[c["name"]] = c["value"]
-    # sessionid 放最前面，方便人眼核对
+    # 登录态相关的排前面，方便人眼核对
     ordered = []
-    if "sessionid" in picked:
-        ordered.append(f"sessionid={picked.pop('sessionid')}")
+    for k in ("pjwt", "session", "smac", "cf_clearance", "sessionid"):
+        if k in picked:
+            ordered.append(f"{k}={picked.pop(k)}")
     ordered += [f"{k}={v}" for k, v in picked.items()]
     return "; ".join(ordered)
+
+
+def _auth_cookie_present(cookies) -> bool:
+    """判断这批 cookie 里有没有「已登录」的凭据。
+
+    NodeSeek 登录成功后下发的关键 cookie：
+      pjwt   —— 登录 JWT（payload 里带 id/name，油猴脚本就是靠它认账号）
+      session —— 服务端会话
+      smac  —— 会话签名
+    其中 pjwt 最可靠（游客不会有带 id/name 的 JWT）。
+    """
+    names = {c.get("name") for c in cookies or []}
+    if "pjwt" in names:
+        return True
+    # 兜底：session + smac 同时存在也算已登录
+    return "session" in names and "smac" in names
+
+
+def _verify_authenticated(page) -> Optional[bool]:
+    """拿一次真实的站内请求确认登录态。
+
+    返回 True=已登录，False=未登录，None=判断不了（网络/风控）。
+    比「看 cookie 里有没有某个名字」可靠，因为站点随时可能改字段名。
+    """
+    try:
+        res = page.evaluate(
+            """async (api) => {
+                try {
+                    const r = await fetch(api, {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {'x-csrf-challenge': 'simple-token'}
+                    });
+                    const t = await r.text();
+                    return {status: r.status, text: (t || '').slice(0, 400)};
+                } catch (e) {
+                    return {error: String(e && e.message ? e.message : e)};
+                }
+            }""",
+            AUTH_PROBE_API,
+        )
+    except Exception as e:
+        _log(f"登录态探测异常：{type(e).__name__}")
+        return None
+    if not res or res.get("error"):
+        return None
+    status = res.get("status")
+    text = (res.get("text") or "")
+    if status in (401, 403):
+        return False
+    if status == 200:
+        # 登录用户会返回 credit 等业务数据；未登录时不会带 success 字段
+        return True if ("success" in text or "credit" in text or "balance" in text) else None
+    return None
+
+
+def _install_api_logger(page):
+    """给页面装一个「API 响应记录器」。
+
+    用途：邮箱验证提交后，服务器到底回了什么（成功？验证码错误？过期？）
+    只有看到原文才能确定。而 Camoufox（Firefox 内核）下 Playwright 读响应体
+    会因 content-encoding: br 报 NS_ERROR_INVALID_CONTENT_ENCODING，
+    但页面 JS 里的 resp.text() 用的是浏览器自己的解码器，能正常读到。
+    """
+    try:
+        page.evaluate(
+            """() => {
+                if (window.__ns_api_log) return;
+                window.__ns_api_log = [];
+                const push = (url, status, body) => {
+                    try {
+                        const item = {
+                            url: String(url).slice(0, 200),
+                            status: status,
+                            body: String(body || '').slice(0, 800)
+                        };
+                        window.__ns_api_log.push(item);
+                        if (window.__ns_api_log.length > 50) window.__ns_api_log.shift();
+                        // 同时写一份到 localStorage：页面一跳转 window 上的东西就没了，
+                        // 但 localStorage 是同源持久化的，跨页面还能读到。
+                        try {
+                            localStorage.setItem('__ns_api_log', JSON.stringify(window.__ns_api_log));
+                        } catch (e) {}
+                    } catch (e) {}
+                };
+                try {
+                    const origFetch = window.fetch.bind(window);
+                    window.fetch = async function(input, init) {
+                        const url = typeof input === 'string' ? input : (input && input.url) || '';
+                        const resp = await origFetch(input, init);
+                        if (url.indexOf('/api/') !== -1) {
+                            try {
+                                const clone = resp.clone();
+                                const t = await clone.text();
+                                push(url, resp.status, t);
+                            } catch (e) {
+                                push(url, resp.status, 'CLONE_ERR:' + (e && e.message ? e.message : e));
+                            }
+                        }
+                        return resp;
+                    };
+                } catch (e) {}
+                try {
+                    const origOpen = XMLHttpRequest.prototype.open;
+                    const origSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this.__ns_url = url;
+                        return origOpen.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function() {
+                        const xhr = this;
+                        if (xhr.__ns_url && String(xhr.__ns_url).indexOf('/api/') !== -1) {
+                            xhr.addEventListener('load', function() {
+                                let b = '';
+                                try { b = xhr.responseText; } catch (e) { b = 'READ_ERR'; }
+                                push(xhr.__ns_url, xhr.status, b);
+                            });
+                        }
+                        return origSend.apply(this, arguments);
+                    };
+                } catch (e) {}
+            }"""
+        )
+    except Exception as e:
+        _log(f"API 记录器安装失败：{type(e).__name__}")
+
+
+def _read_api_log(page) -> list:
+    """读回 API 记录器收集到的响应列表。
+
+    优先读 window（页面没跳转时）；页面跳走了就读 localStorage 里的副本。
+    """
+    try:
+        log = page.evaluate("() => window.__ns_api_log || []")
+        if isinstance(log, list) and log:
+            return log
+    except Exception:
+        pass
+    try:
+        raw = page.evaluate("() => localStorage.getItem('__ns_api_log')")
+        if raw:
+            import json as _json
+            log = _json.loads(raw)
+            if isinstance(log, list):
+                return log
+    except Exception:
+        pass
+    return []
+
 
 
 # --------------------------------------------------------------------------
@@ -1261,14 +1472,19 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
 
         # 登录接口成功与否，不靠读响应体判断——登录成功后页面会立刻跳转，
         # 响应体随即被浏览器丢弃（Camoufox/Firefox 下读 body 会报
-        # NS_ERROR_INVALID_CONTENT_ENCODING）。真正的判据是 cookie 里有没有 sessionid。
+        # NS_ERROR_INVALID_CONTENT_ENCODING）。真正的判据是登录态 cookie
+        # （pjwt / session / smac）有没有出现。
         page.wait_for_timeout(2500)
         all_cookies = page.context.cookies()
         cookie = cookies_to_string(all_cookies)
         _log(f"提交后 cookie 一览：{[c['name'] for c in all_cookies]}")
-        if "sessionid=" in cookie:
-            _log("登录成功（已拿到 sessionid）")
-            return {"cookie": cookie, "cookies": all_cookies, "username": username}
+        if _auth_cookie_present(all_cookies):
+            verified = _verify_authenticated(page)
+            if verified is False:
+                _log("⚠️ 有 cookie 但站内接口判定未登录，按未登录处理")
+            else:
+                _log("登录成功（已拿到登录态 cookie）")
+                return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
         # 没有 sessionid：优先用主动 fetch 拿到的响应体，其次读拦截器，最后读网络层响应
         status = None
@@ -1322,6 +1538,23 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             except Exception:
                 pass
 
+        # 接口说成功、也没要求二次验证，但 cookie 里还没看到登录态
+        # → 有些站点是「页面跳走时」才下发 cookie，这里主动刷一次首页再取
+        if (data and isinstance(data, dict) and data.get("success")
+                and not data.get("redirect") and not _auth_cookie_present(all_cookies)):
+            _log("接口返回成功但暂未看到登录态 cookie，刷新首页再取一次…")
+            try:
+                page.goto(ORIGIN + "/", wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(2500)
+                all_cookies = page.context.cookies()
+                cookie = cookies_to_string(all_cookies)
+                _log(f"刷新后 cookie 一览：{[c['name'] for c in all_cookies]}")
+                if _auth_cookie_present(all_cookies):
+                    _log("登录成功（刷新后拿到登录态 cookie）")
+                    return {"cookie": cookie, "cookies": all_cookies, "username": username}
+            except Exception as e:
+                _log(f"刷新取 cookie 失败：{type(e).__name__}")
+
         # 邮箱二次验证：密码登录成功（success:true）但返回 redirect 到 emailSignIn/smsSignIn，
         # 说明账号或「新设备」需要邮箱验证码二次确认。这是登录流程的一部分，不是失败。
         if data and isinstance(data, dict) and data.get("success") and data.get("redirect"):
@@ -1359,7 +1592,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             except Exception:
                 pass
             cookie = cookies_to_string(page.context.cookies())
-            if "sessionid=" in cookie:
+            if _auth_cookie_present(page.context.cookies()):
                 _log("2FA 登录成功")
                 return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
             raise LoginError("NEED_2FA", "2FA 验证未通过，请检查 TOTP 密钥是否正确")
