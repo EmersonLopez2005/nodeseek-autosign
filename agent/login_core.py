@@ -456,8 +456,11 @@ def _install_signin_interceptor(page):
     同时保留 JS 层的 fetch/XHR hook 作为双保险（有些场景 route 不触发）。
     """
     try:
+        # 注意：page.route 的 URL 匹配函数收到的参数是「URL 字符串」，不是 Request 对象。
+        # 之前写成 lambda r: ... r.url 会 AttributeError，且该错误在事件监听器里抛出，
+        # 连带把后续 context.cookies() 也搞挂。这里用 **/api/account/signIn 通配字符串。
         page.route(
-            lambda r: SIGNIN_API_MARK in (r.url or ""),
+            "**/api/account/signIn",
             lambda route: route.continue_(
                 headers={**route.request.headers, "Accept-Encoding": "gzip, deflate"}
             ),
