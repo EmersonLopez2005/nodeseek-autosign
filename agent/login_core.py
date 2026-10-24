@@ -68,6 +68,34 @@ def _log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _probe_webgl(page):
+    """把 WebGL 渲染器打进日志 —— 一锤定音的指纹证据。
+
+    Xvfb 下没装 Mesa 时是 "Google SwiftShader"（CF 已知 bot 特征，
+    会被 Turnstile onError 直接拒绝）；
+    装了 libgl1-mesa-dri 后是 "llvmpipe"，是正常桌面会有的值。
+    """
+    try:
+        r = page.evaluate(
+            """() => {
+                try {
+                    const c = document.createElement('canvas');
+                    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+                    if (!gl) return 'NO_WEBGL';
+                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                    if (!ext) return 'NO_EXT';
+                    return String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL));
+                } catch (e) { return 'ERR_' + (e.message || e); }
+            }"""
+        )
+        if "swiftshader" in (r or "").lower():
+            _log(f"WebGL 渲染器：{r}  ← 这就是被拒的原因，执行：apt install -y libgl1 libgl1-mesa-dri")
+        else:
+            _log(f"WebGL 渲染器：{r}")
+    except Exception:
+        pass
+
+
 def _first_visible(page, selectors, timeout=8000):
     """依次尝试选择器，返回第一个可见元素。"""
     deadline = time.time() + timeout / 1000
@@ -440,6 +468,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
     """
     _log(f"打开登录页 {LOGIN_URL}")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    _probe_webgl(page)
     if not _wait_out_challenge(page):
         _debug_dump(page, "challenge_stuck")
         raise LoginError(

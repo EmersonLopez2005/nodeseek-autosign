@@ -255,6 +255,31 @@ def check_challenge(url, headless, wait=45):
             title = page.title()
             say(OK if passed else WARN, f"页面标题：{title!r}")
 
+            # WebGL 渲染器是 Turnstile 拒绝交互的头号指纹嫌疑，直接打出来
+            try:
+                renderer = page.evaluate(
+                    """() => {
+                        try {
+                            const c = document.createElement('canvas');
+                            const gl = c.getContext('webgl');
+                            if (!gl) return 'NO_WEBGL';
+                            const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                            return ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : 'NO_EXT';
+                        } catch (e) { return 'ERR'; }
+                    }"""
+                )
+                if "swiftshader" in (renderer or "").lower():
+                    say(BAD, f"WebGL 渲染器：{renderer}")
+                    say(BAD, "  ← SwiftShader 是 Cloudflare 已知的 bot 特征，Turnstile 会直接拒绝")
+                    say(BAD, "     修复：sudo apt install -y libgl1 libgl1-mesa-dri，然后重跑")
+                    results["webgl"] = "swiftshader"
+                else:
+                    say(OK, f"WebGL 渲染器：{renderer}")
+                    results["webgl"] = renderer
+            except Exception as e:
+                say(WARN, f"WebGL 探测失败：{type(e).__name__}")
+                results["webgl"] = "unknown"
+
             has_user = page.locator("#stacked-email").count() > 0
             say(OK if has_user else BAD,
                 f"登录表单：{'已加载（#stacked-email 存在）' if has_user else '没找到，可能还在挑战页'}")
