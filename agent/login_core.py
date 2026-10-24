@@ -442,6 +442,86 @@ def _dismiss_dialog(page):
             continue
 
 
+def _signin_via_page_fetch(page, username: str, password: str):
+    """在页面 JS 上下文里主动 fetch 登录，拿到真实响应体。
+
+    为什么要这么做（2026-10 实测根因）：
+      NodeSeek 登录响应是 content-encoding: br（Brotli），Camoufox/Firefox 内核下
+      Playwright 的 resp.body()/resp.json()/resp.text() 全部报
+      NS_ERROR_INVALID_CONTENT_ENCODING，导致只能看到「HTTP 200」而读不到失败原因。
+
+      而在页面自己的 JS 环境里 await resp.text()，用的是浏览器内置解码器，
+      能正确解 br。所以这里绕过 Playwright 的网络层，直接在页面里发请求、读 body。
+
+      登录所需的 header 都从前端已有的值里取：
+        - x-captcha-token   = Turnstile token（hidden input）
+        - x-security-token  = localStorage.security_token
+        - x-integrity-token = FingerprintJS visitorId（若前端暴露在 window 上）
+    """
+    js = """
+    async (payload) => {
+        const out = { status: null, body: '', error: null };
+
+        const getToken = () => {
+            const el = document.querySelector('input[name="cf-turnstile-response"]');
+            if (el && el.value) return el.value;
+            const tas = document.querySelectorAll('textarea[name="cf-turnstile-response"]');
+            for (const t of tas) { if (t.value) return t.value; }
+            return '';
+        };
+
+        const captchaToken = getToken();
+        if (!captchaToken) {
+            out.error = 'NO_CAPTCHA_TOKEN';
+            return out;
+        }
+
+        let securityToken = '';
+        try { securityToken = localStorage.getItem('security_token') || ''; } catch (e) {}
+
+        // FingerprintJS visitorId：可能挂在 window 上，或需要现算（先探测常见位置）
+        let integrityToken = '';
+        try {
+            integrityToken = window.__visitorId
+                || window.visitorId
+                || (window.fp && window.fp.visitorId)
+                || '';
+        } catch (e) {}
+
+        const headers = {
+            'content-type': 'application/json',
+            'x-captcha-token': captchaToken,
+            'x-captcha-source': 'turnstile',
+        };
+        if (securityToken) headers['x-security-token'] = securityToken;
+        if (integrityToken) headers['x-integrity-token'] = integrityToken;
+
+        try {
+            const resp = await fetch('/api/account/signIn', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ username: payload.username, password: payload.password }),
+                credentials: 'include',
+            });
+            out.status = resp.status;
+            try {
+                out.body = await resp.text();
+            } catch (e) {
+                out.body = 'BODY_ERR:' + (e && e.message ? e.message : e);
+            }
+        } catch (e) {
+            out.error = String(e && e.message ? e.message : e);
+        }
+        return out;
+    }
+    """
+    try:
+        return page.evaluate(js, {"username": username, "password": password})
+    except Exception as e:
+        _log(f"主动 fetch 登录异常：{type(e).__name__}: {e}")
+        return None
+
+
 def _install_signin_interceptor(page):
     """用 page.route 拦截 signIn 请求，去掉 Accept-Encoding: br，让响应体可读。
 
@@ -724,6 +804,11 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
     page.wait_for_timeout(1500)
     _dump_form_structure(page)
 
+    # 登录表单可能是异步渲染的，dump 之后再多等一会儿，让表单真正加载出来
+    page.wait_for_timeout(3000)
+    _log("等待登录表单渲染后再次 dump…")
+    _dump_form_structure(page)
+
     # 有些版本的登录页默认是“邮箱验证码”模式，需要切到密码模式
     user_input = _first_visible(page, USERNAME_SELECTORS, timeout=6000)
     if user_input is None:
@@ -742,6 +827,12 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         _debug_dump(page, "login_page")
         raise LoginError("PAGE_ERROR", "登录页找不到用户名输入框（站点可能改版），已截图 data/debug_login_page.png")
 
+    # 诊断：打印匹配到的用户名/密码框的真实属性，确认没有误匹配到搜索框
+    try:
+        _log(f"匹配到的用户名框：{user_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
+    except Exception:
+        pass
+
     last_msg = ""
     for attempt in range(1, max_attempts + 1):
         _log(f"第 {attempt}/{max_attempts} 次尝试登录：{username}")
@@ -750,6 +841,10 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         pwd_input = _first_visible(page, PASSWORD_SELECTORS, timeout=5000)
         if pwd_input is None:
             raise LoginError("PAGE_ERROR", "登录页找不到密码输入框")
+        try:
+            _log(f"匹配到的密码框：{pwd_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
+        except Exception:
+            pass
 
         # 清空后重新填，避免上次残留
         for loc, value in ((user_input, username), (pwd_input, password)):
@@ -775,27 +870,37 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             raise
 
         submit = _first_visible(page, SUBMIT_SELECTORS, timeout=5000)
-        if submit is None:
-            raise LoginError("PAGE_ERROR", "找不到登录按钮")
 
-        # 提交前装好 fetch 拦截器：登录是前端 JS 自己 fetch 的，
-        # 只有这样才能在 JS 层拿到接口真实响应体（token 无效/密码错/2FA）。
-        _install_signin_interceptor(page)
-
-        resp = None
-        try:
-            with page.expect_response(
-                lambda r: SIGNIN_API_MARK in r.url, timeout=30000
-            ) as resp_info:
-                submit.click(timeout=8000)
-            resp = resp_info.value
-        except Exception as e:
-            last_msg = f"提交后未拿到接口响应（{type(e).__name__}）"
-            _log(last_msg)
-            if attempt < max_attempts:
-                _log("重新加载登录页后重试")
-                user_input = _reload_login_page(page)
-            continue
+        # 关键修复：不再依赖「点击 submit → expect_response 读响应体」。
+        # 根因（2026-10 实测）：登录响应是 content-encoding: br（Brotli），
+        # Camoufox/Firefox 内核下 Playwright 读 body 报 NS_ERROR_INVALID_CONTENT_ENCODING，
+        # resp.body() 直接 Error，导致永远只能看到「HTTP 200」而不知道失败原因。
+        # 改法：在页面 JS 上下文里自己 fetch 登录，用 resp.text() 在 JS 层读 body
+        # （浏览器自己的解码器能正确解 br），把 status + body 原文带回 Python。
+        result = _signin_via_page_fetch(page, username, password)
+        if result is None:
+            # 主动 fetch 失败（可能前端有额外 header 逻辑），回退到点击 submit
+            _log("主动 fetch 登录失败，回退到点击登录按钮…")
+            if submit is None:
+                raise LoginError("PAGE_ERROR", "找不到登录按钮")
+            _install_signin_interceptor(page)
+            resp = None
+            try:
+                with page.expect_response(
+                    lambda r: SIGNIN_API_MARK in r.url, timeout=30000
+                ) as resp_info:
+                    submit.click(timeout=8000)
+                resp = resp_info.value
+            except Exception as e:
+                last_msg = f"提交后未拿到接口响应（{type(e).__name__}）"
+                _log(last_msg)
+                if attempt < max_attempts:
+                    _log("重新加载登录页后重试")
+                    user_input = _reload_login_page(page)
+                continue
+            page.wait_for_timeout(2500)
+        else:
+            resp = None
 
         # 登录接口成功与否，不靠读响应体判断——登录成功后页面会立刻跳转，
         # 响应体随即被浏览器丢弃（Camoufox/Firefox 下读 body 会报
@@ -808,24 +913,32 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             _log("登录成功（已拿到 sessionid）")
             return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
-        # 没有 sessionid：先读 fetch/XHR 拦截器捕获的接口原文，再用网络层响应兜底
-        debug = _read_signin_debug(page)
+        # 没有 sessionid：优先用主动 fetch 拿到的响应体，其次读拦截器，最后读网络层响应
         status = None
         data = None
-        if debug and isinstance(debug, dict):
-            status = debug.get("status")
-            body_text = debug.get("respBody") or ""
+        if result and isinstance(result, dict):
+            status = result.get("status")
+            body_text = result.get("body") or ""
             if body_text:
                 try:
                     data = json.loads(body_text)
                 except Exception:
                     data = body_text
-            if debug.get("fetchErr") or debug.get("xhrErr"):
-                _log(f"signIn 请求报错：{debug.get('fetchErr') or debug.get('xhrErr')}")
+            _log(f"主动 fetch 响应：status={status} body={body_text[:500]}")
 
-        # 兜底：拦截器没抓到（或抓到的是非 JSON）时，直接从 Playwright 响应对象读原始字节。
-        # Camoufox/Firefox 下 resp.json()/resp.text() 会报 NS_ERROR_INVALID_CONTENT_ENCODING，
-        # 但 resp.body() 拿的是原始字节，可以自己解码。
+        if data is None:
+            debug = _read_signin_debug(page)
+            if debug and isinstance(debug, dict):
+                status = debug.get("status")
+                body_text = debug.get("respBody") or ""
+                if body_text:
+                    try:
+                        data = json.loads(body_text)
+                    except Exception:
+                        data = body_text
+                if debug.get("fetchErr") or debug.get("xhrErr"):
+                    _log(f"signIn 请求报错：{debug.get('fetchErr') or debug.get('xhrErr')}")
+
         if data is None and resp is not None:
             status = resp.status
             raw = None
@@ -843,10 +956,8 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                     except Exception:
                         continue
                 else:
-                    # 都不是合法 JSON，当作纯文本保留前 300 字节
                     data = raw.decode("utf-8", errors="replace")[:300]
                     _log(f"响应体非 JSON：{data}")
-            # 响应头也打出来，帮助判断 Content-Encoding / Set-Cookie 问题
             try:
                 _log(f"响应头：content-type={resp.headers.get('content-type')} "
                      f"content-encoding={resp.headers.get('content-encoding')} "
