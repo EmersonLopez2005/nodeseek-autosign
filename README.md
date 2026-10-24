@@ -303,8 +303,8 @@ tar -xzf /root/nodeseek-backup-*.tar.gz -C "$PWD/"   # 恢复 .env 和 cookie
 ### 8.1 systemd 服务（`install_vps.sh --agent` 装的）
 
 ```bash
-sudo systemctl disable --now nodeseek-login-agent
-sudo rm -f /etc/systemd/system/nodeseek-login-agent.service
+sudo systemctl disable --now nodeseek-agent
+sudo rm -f /etc/systemd/system/nodeseek-agent.service
 sudo systemctl daemon-reload
 ```
 

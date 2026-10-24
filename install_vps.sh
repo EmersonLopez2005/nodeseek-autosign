@@ -193,7 +193,7 @@ chmod 600 "$APP_DIR/.env" 2>/dev/null || true
 
 # ---------------------------------------------------------------- systemd
 if [ "$MODE" = "--agent" ]; then
-  step "注册 systemd 常驻服务（nodeseek-login-agent）"
+  step "注册 systemd 常驻服务（nodeseek-agent）"
   TOKEN="$(grep -E '^AGENT_TOKEN=' "$APP_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' )"
   PORT="$(grep -E '^AGENT_PORT=' "$APP_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"')"
   PORT="${PORT:-3000}"

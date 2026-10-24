@@ -39,6 +39,16 @@ sz() { du -sm "$1" 2>/dev/null | awk '{print $1}'; }
 # ============================================================ 扫描
 step "扫描待卸载内容"
 
+# 服务名有两个历史写法，两个都认
+SVC_NAMES="nodeseek-agent nodeseek-login-agent"
+SVC_FOUND=""
+for s in $SVC_NAMES; do
+  if systemctl list-unit-files 2>/dev/null | grep -q "^$s" \
+     || [ -f "/etc/systemd/system/$s.service" ]; then
+    SVC_FOUND="$SVC_FOUND $s.service"
+  fi
+done
+
 echo "【项目本体】"
 printf '  %8s  %s\n' "$(sz "$APP_DIR")MB" "$APP_DIR"
 if [ -d "$APP_DIR/.venv" ]; then
@@ -50,14 +60,38 @@ fi
 
 echo
 echo "【浏览器本体（缓存）】"
-for d in "$HOME/.cache/camoufox" "$HOME/.cache/ms-playwright" "$HOME/.cache/ms-playwright-chromium" "$HOME/.cache/patchright"; do
+for d in "$HOME/.cache/camoufox" "$HOME/.cache/ms-playwright" "$HOME/.cache/ms-playwright-chromium" "$HOME/.cache/patchright" "/opt/camoufox" "/opt/playwright"; do
   [ -e "$d" ] && printf '  %8s  %s\n' "$(sz "$d")MB" "$d"
 done
 
 echo
+echo "【apt 装的浏览器包】"
+APT_BROWSERS=""
+if command -v dpkg-query >/dev/null 2>&1; then
+  APT_BROWSERS="$(dpkg-query -W -f='${binary:Package}\t${Installed-Size}\n' 2>/dev/null \
+    | awk '/^(chromium|firefox|firefox-esr|chromium-driver|firefox-geckodriver|chromium-common)/ {print $1"\t"$2}')"
+fi
+if [ -n "$APT_BROWSERS" ]; then
+  echo "$APT_BROWSERS" | while IFS=$'\t' read -r pkg kb; do
+    [ -z "$pkg" ] && continue
+    printf '  %8s  %s\n' "$((kb / 1024))MB" "$pkg"
+  done
+else
+  echo "  （没有）"
+fi
+
+echo
+echo "【pip 装的浏览器引擎（全局）】"
+PIP_ENGINES=""
+if command -v pip3 >/dev/null 2>&1; then
+  PIP_ENGINES="$(pip3 list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Ei '^(camoufox|patchright|playwright)$' | tr '\n' ' ')"
+fi
+[ -n "$PIP_ENGINES" ] && echo "  $PIP_ENGINES" || echo "  （没有）"
+
+echo
 echo "【systemd 服务】"
-if systemctl list-unit-files 2>/dev/null | grep -q '^nodeseek-agent'; then
-  echo "  nodeseek-agent.service（$APP_DIR/agent/nodeseek_login_agent.py）"
+if [ -n "$SVC_FOUND" ]; then
+  for s in $SVC_FOUND; do echo "  $s"; done
 else
   echo "  （没装）"
 fi
@@ -107,7 +141,10 @@ fi
 # ============================================================ 备份
 step "备份配置与登录态"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BAK="/root/nodeseek-backup-$STAMP.tar.gz"
+# 备份目录：优先项目同级（一定能写），否则退回 HOME
+BAK_DIR="$(dirname "$APP_DIR")"
+[ -w "$BAK_DIR" ] || BAK_DIR="$HOME"
+BAK="$BAK_DIR/nodeseek-backup-$STAMP.tar.gz"
 BAK_LIST=""
 [ -f "$APP_DIR/.env" ] && BAK_LIST="$BAK_LIST .env"
 [ -d "$APP_DIR/cookie" ] && BAK_LIST="$BAK_LIST cookie"
@@ -119,6 +156,7 @@ if [ -n "$BAK_LIST" ]; then
     echo "     tar -xzf $BAK -C /path/to/nodeseek-autosign/"
   else
     red "  备份失败！中止卸载（避免丢配置）"
+    red "  手动检查：tar -czf $BAK -C $APP_DIR $BAK_LIST"
     exit 1
   fi
 else
@@ -127,11 +165,13 @@ fi
 
 # ============================================================ 卸载
 step "停止服务"
-if systemctl list-unit-files 2>/dev/null | grep -q '^nodeseek-agent'; then
-  systemctl disable --now nodeseek-agent >/dev/null 2>&1
-  rm -f /etc/systemd/system/nodeseek-agent.service
+if [ -n "$SVC_FOUND" ]; then
+  for s in $SVC_FOUND; do
+    systemctl disable --now "$s" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/$s"
+    grn "  已停用并移除 $s"
+  done
   systemctl daemon-reload >/dev/null 2>&1
-  grn "  已停用并移除 nodeseek-agent.service"
 else
   echo "  （无 systemd 服务）"
 fi
@@ -151,13 +191,28 @@ if command -v docker >/dev/null 2>&1; then
   echo "  已清理"
 fi
 
+step "清理全局 pip 浏览器引擎"
+if [ -n "$PIP_ENGINES" ]; then
+  for pkg in $PIP_ENGINES; do
+    pip3 uninstall -y "$pkg" >/dev/null 2>&1 && grn "  已卸包：$pkg" || ylw "  卸包失败：$pkg"
+  done
+else
+  echo "  （无）"
+fi
+
 step "删除浏览器本体"
-for d in "$HOME/.cache/camoufox" "$HOME/.cache/ms-playwright" "$HOME/.cache/ms-playwright-chromium" "$HOME/.cache/patchright"; do
+for d in "$HOME/.cache/camoufox" "$HOME/.cache/ms-playwright" "$HOME/.cache/ms-playwright-chromium" "$HOME/.cache/patchright" "/opt/camoufox" "/opt/playwright"; do
   if [ -e "$d" ]; then
     s=$(sz "$d")
-    # 安全阀：只允许删 ~/.cache 下的浏览器目录
+    # 安全阀：只允许删 ~/.cache 与 /opt 下的浏览器目录
     case "$d" in
-      "$HOME"/.cache/*) rm -rf "$d" && grn "  已删 $d（${s}MB）" ;;
+      "$HOME"/.cache/*|/opt/camoufox|/opt/playwright)
+        if rm -rf "$d" 2>/dev/null && [ ! -e "$d" ]; then
+          grn "  已删 $d（${s}MB）"
+        else
+          red "  删不掉 $d（权限不足？用 sudo 重跑）"
+        fi
+        ;;
       *) ylw "  跳过（路径不在白名单）：$d" ;;
     esac
   fi
@@ -169,8 +224,31 @@ if [ "$APP_DIR" = "/" ] || [ "$APP_DIR" = "/root" ] || [ -z "$APP_DIR" ]; then
   exit 1
 fi
 TMP="/tmp/nodeseek-uninstall-$(date +%s)"
-mv "$APP_DIR" "$TMP" && grn "  已移出原位：$TMP"
-rm -rf "$TMP" && grn "  已删除项目目录（含 .venv / cookie / profile）"
+if mv "$APP_DIR" "$TMP" 2>/dev/null; then
+  grn "  已移出原位：$TMP"
+  if rm -rf "$TMP" 2>/dev/null && [ ! -e "$TMP" ]; then
+    grn "  已删除项目目录（含 .venv / cookie / profile）"
+  else
+    red "  目录已移走但删除失败，请手动删：rm -rf $TMP"
+  fi
+else
+  # mv 失败（跨挂载点 / 权限）：直接原地删
+  if rm -rf "$APP_DIR" 2>/dev/null && [ ! -e "$APP_DIR" ]; then
+    grn "  已删除项目目录（含 .venv / cookie / profile）"
+  else
+    red "  删除项目目录失败，请手动处理：$APP_DIR"
+    red "  （可能权限不足，用 sudo 跑一次本脚本）"
+  fi
+fi
+
+step "可选：apt 浏览器包"
+if [ -n "$APT_BROWSERS" ]; then
+  APT_REMOVE="$(echo "$APT_BROWSERS" | cut -f1 | tr '\n' ' ')"
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq --purge $APT_REMOVE >/dev/null 2>&1
+  grn "  已卸载：$APT_REMOVE"
+else
+  echo "  （无）"
+fi
 
 step "可选：系统依赖"
 if [ "$PURGE_DEPS" = "1" ]; then
@@ -192,10 +270,34 @@ if [ "$WITH_SWAP" = "1" ] && [ -f /swapfile ]; then
   grn "  已删除 /swapfile 并清理 fstab"
 fi
 
+# ============================================================ 验证
+step "验证是否清干净"
+LEFTOVER=""
+for s in $SVC_NAMES; do
+  systemctl list-unit-files 2>/dev/null | grep -q "^$s" && LEFTOVER="$LEFTOVER $s.service"
+done
+[ -d "$APP_DIR" ] && LEFTOVER="$LEFTOVER $APP_DIR"
+for d in "$HOME/.cache/camoufox" "$HOME/.cache/ms-playwright" "$HOME/.cache/patchright" "/opt/camoufox"; do
+  [ -e "$d" ] && LEFTOVER="$LEFTOVER $d"
+done
+crontab -l 2>/dev/null | grep -qi "nodeseek\|multi_site_sign" && LEFTOVER="$LEFTOVER crontab"
+docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi nodeseek && LEFTOVER="$LEFTOVER docker"
+
+if [ -n "$LEFTOVER" ]; then
+  ylw "  仍有残留：$LEFTOVER"
+  ylw "  手动确认后处理（服务: systemctl disable --now <name> && rm /etc/systemd/system/<name>）"
+else
+  grn "  干净了：无服务、无项目目录、无浏览器缓存、无定时任务、无容器"
+fi
+
 step "卸载完成"
-grn "  这台机器已经干净了。"
+grn "  这台机器已经清理完毕。"
 echo
 echo "  备份：$BAK"
+echo "  ⚠️ 备份里是明文密码 + 登录 cookie，scp 走之后记得删掉原文件："
+echo "    scp $BAK <新机器>:/root/    # 传走"
+echo "    rm -f $BAK                 # 传走后删掉本机副本"
+echo
 echo "  明天在新机器上："
 echo "    git clone https://github.com/EmersonLopez2005/nodeseek-autosign.git"
 echo "    cd nodeseek-autosign && bash install_vps.sh"
