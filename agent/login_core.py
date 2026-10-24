@@ -74,6 +74,7 @@ def _probe_webgl(page):
     Xvfb 下没装 Mesa 时是 "Google SwiftShader"（CF 已知 bot 特征，
     会被 Turnstile onError 直接拒绝）；
     装了 libgl1-mesa-dri 后是 "llvmpipe"，是正常桌面会有的值。
+    连 WebGL 都没有（NO_WEBGL）说明 GPU 进程没起来，往往缺 libegl1/libgles2。
     """
     try:
         r = page.evaluate(
@@ -90,14 +91,41 @@ def _probe_webgl(page):
         )
         r = (r or "").strip()
         if "swiftshader" in r.lower():
-            _log(f"WebGL 渲染器：{r}  ← 这是 CF 已知 bot 特征，执行：apt install -y libgl1 libgl1-mesa-dri")
+            _log(f"WebGL 渲染器：{r}  ← CF 已知 bot 特征，执行：apt install -y libgl1 libgl1-mesa-dri")
         elif r in ("NO_WEBGL", "NO_EXT", "ERR", "") or r.startswith("ERR_"):
-            _log(f"WebGL 渲染器：{r}  ← 浏览器完全没有 WebGL！正常桌面不会这样，"
-                 f"Turnstile 必拒。修复：apt install -y libgl1 libgl1-mesa-dri 后重跑")
+            _log(f"WebGL 渲染器：{r}  ← 浏览器完全没有 WebGL！GPU 进程没起来。"
+                 f"先试：apt install -y libegl1 libgles2；仍无效就换 AGENT_ENGINE=camoufox")
         else:
             _log(f"WebGL 渲染器：{r}")
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f"WebGL 探测异常：{type(e).__name__}")
+
+
+def _dump_gpu_info(page):
+    """更深的 GPU 诊断：Chromium 内部看到的 GL 实现与 GPU 特性。"""
+    try:
+        info = page.evaluate(
+            """() => {
+                const out = {};
+                try {
+                    const c = document.createElement('canvas');
+                    const gl = c.getContext('webgl');
+                    if (gl) {
+                        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                        out.renderer = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : 'NO_EXT';
+                        out.vendor = ext ? String(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)) : '?';
+                        out.version = String(gl.getParameter(gl.VERSION));
+                        out.glsl = String(gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+                    } else {
+                        out.renderer = 'NO_WEBGL';
+                    }
+                } catch (e) { out.err = String(e.message || e); }
+                return out;
+            }"""
+        )
+        _log(f"GPU 详情：{info}")
+    except Exception as e:
+        _log(f"GPU 详情获取失败：{type(e).__name__}")
 
 
 def _first_visible(page, selectors, timeout=8000):
@@ -473,6 +501,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
     _log(f"打开登录页 {LOGIN_URL}")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
     _probe_webgl(page)
+    _dump_gpu_info(page)
     if not _wait_out_challenge(page):
         _debug_dump(page, "challenge_stuck")
         raise LoginError(
