@@ -227,6 +227,8 @@ def _camoufox_page(headless, user_data_dir, proxy_cfg, locale, humanize):
         geoip=False,
         # 关键：禁用 COOP，否则跨域 iframe 里的 Turnstile 复选框点不到
         disable_coop=True,
+        # 明确知道禁用 COOP 可能被高级 WAF 探测，这是为了过 Turnstile 的必要取舍
+        i_know_what_im_doing=True,
     )
     if user_data_dir:
         kwargs["user_data_dir"] = user_data_dir

@@ -67,6 +67,9 @@ step "安装系统依赖（Chromium 运行库 + Xvfb + 中文字体）"
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
 
+# libgtk-3-0 / libdbus-glib-1-2 / libxt6：Camoufox(Firefox) 的硬依赖。
+# Chromium 跑得动不代表 Firefox 也跑得动，GTK3 缺了会报
+# "libgtk-3.so.0: cannot open shared object file" 直接退出。
 # libgl1 / libgl1-mesa-dri / libegl1 / libgles2：Xvfb 下的软件 OpenGL（llvmpipe）。
 # 没有它们，Chromium 的 GPU 进程起不来，WebGL 直接 NO_WEBGL 或暴露 SwiftShader
 # —— 都是 Cloudflare 已知的 bot 特征，Turnstile 会 onError 拒绝交互。
@@ -76,6 +79,7 @@ libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
 libgbm1 libatspi2.0-0 libx11-xcb1 libxcb1 libxext6 libxi6 libxtst6 \
 libpango-1.0-0 libcairo2 libdbus-1-3 libexpat1 libglib2.0-0 \
 libgl1 libgl1-mesa-dri libegl1 libgles2 \
+libgtk-3-0 libdbus-glib-1-2 libxt6 \
 fonts-noto-cjk fonts-wqy-zenhei fonts-liberation"
 
 # Debian 13(trixie) / Ubuntu 24.04 改过一些包名（libasound2 → libasound2t64 等），
