@@ -2,6 +2,7 @@
 # 浏览器登录需要真实 Chromium，所以依赖里有 patchright
 requests>=2.25.0
 curl-cffi>=0.5.0
+python-dotenv>=1.0.0    # 读 .env（VPS 上不配这个，NS_USER_PASS 会读不到）
 flask>=3.0.0
 pyotp>=2.9.0            # 只有开 2FA 的账号需要
 

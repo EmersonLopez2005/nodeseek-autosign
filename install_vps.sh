@@ -106,8 +106,12 @@ if [ ! -x "$PY" ]; then
   python3 -m venv "$VENV"
 fi
 "$PY" -m pip install -q --upgrade pip
-"$PY" -m pip install -q -r "$APP_DIR/requirements.txt" 2>/dev/null || \
+"$PY" -m pip install -q -r "$APP_DIR/requirements.txt" || {
+  ylw "  requirements.txt 装失败，改用 agent/requirements.txt"
   "$PY" -m pip install -q -r "$APP_DIR/agent/requirements.txt"
+}
+# 读 .env 必须有它，缺了会导致 NS_USER_PASS 读不到
+"$PY" -c "import dotenv" 2>/dev/null || "$PY" -m pip install -q python-dotenv
 grn "  Python 依赖完成"
 
 # ---------------------------------------------------------------- 浏览器

@@ -34,11 +34,16 @@ except ImportError:
     browser_login = None
     browser_sign = None
 
-# 环境变量
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except: pass
+# 环境变量（显式指向脚本同目录的 .env，避免 cwd 不同读不到）
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_ENV_FILE):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_ENV_FILE, override=False)
+    except ImportError:
+        print("!! 检测到 .env，但没装 python-dotenv，里面的配置不会生效")
+        print("   修复：.venv/bin/pip install python-dotenv")
+        print("   （或者直接把变量 export 到环境里）")
 
 # === 通知模块 ===
 hadsend = False
@@ -93,7 +98,8 @@ def make_refract_headers(method, url, body="", refract_key=None):
 
 
 # === 通知状态管理 ===
-NOTIFICATION_FILE = "./cookie/notification_status.json"
+NOTIFICATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "cookie", "notification_status.json")
 
 
 def load_notification_status():
@@ -133,10 +139,16 @@ def mark_notification_sent(site_name):
 
 
 # === Cookie 文件操作 ===
+_COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie")
+
+
 def get_cookie_file_path(site_name, account_index=None):
+    """按脚本所在目录定位，避免青龙里 cwd 不同导致读写到别处。"""
     if account_index is not None:
-        return f"./cookie/{site_name.upper()}_COOKIE_{account_index}.txt"
-    return f"./cookie/{site_name.upper()}_COOKIE.txt"
+        name = f"{site_name.upper()}_COOKIE_{account_index}.txt"
+    else:
+        name = f"{site_name.upper()}_COOKIE.txt"
+    return os.path.join(_COOKIE_DIR, name)
 
 
 def load_cookies_from_file(site_name, account_index=None):
