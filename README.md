@@ -216,7 +216,90 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 
 ---
 
-## 九、说明
+## 九、卸载
+
+按你实际用过的部署方式删对应部分就行。**先停服务，再删文件**，顺序反了可能留下占着端口的残留进程。
+
+> 只是想暂停、不是彻底删：`sudo systemctl stop nodeseek-login-agent`（Docker 用 `docker compose stop`）
+> 再把定时任务注释掉就够了，文件和 profile 都留着，恢复时 `start` 一下就行。
+> profile 留着还有个好处：`cf_clearance` 和指纹不变，恢复后不用重新过挑战。
+
+### 9.1 systemd 服务（`install_vps.sh --agent` 装的）
+
+```bash
+sudo systemctl disable --now nodeseek-login-agent
+sudo rm -f /etc/systemd/system/nodeseek-login-agent.service
+sudo systemctl daemon-reload
+```
+
+### 9.2 Docker
+
+```bash
+cd agent
+docker compose down -v --rmi local
+```
+
+`-v` 会连数据卷一起删（profile、cookie 全没），`--rmi local` 删掉构建的镜像。
+只想停服务、保留数据就把 `-v --rmi local` 去掉。
+
+### 9.3 定时任务
+
+```bash
+crontab -l | grep -v nodeseek-autosign | crontab -
+```
+
+这条会把含 `nodeseek-autosign` 的行全删掉。不放心就 `crontab -e` 手动删那一行。
+
+### 9.4 目录和浏览器内核
+
+```bash
+rm -rf /opt/nodeseek-autosign      # 换成你实际 clone 的路径
+
+# Chromium 本体约 180MB，patchright / playwright 共用这个缓存目录
+du -sh ~/.cache/ms-playwright ~/.cache/patchright 2>/dev/null   # 先看看占了多大
+rm -rf ~/.cache/ms-playwright ~/.cache/patchright
+```
+
+如果安装脚本给你建过 swap：
+
+```bash
+sudo swapoff /swapfile
+sudo rm -f /swapfile
+sudo sed -i '/swapfile/d' /etc/fstab
+```
+
+> 只在确认那个 swapfile 是本项目建的、且系统没有其他 swap 依赖时才删。
+> 删之前 `free -h` 看一眼，别把自己内存搞崩。
+
+### 9.5 青龙侧
+
+环境变量里删掉这些：
+
+```
+NS_USER_PASS  NS_COOKIE  NS_TOTP_SECRET  NS_TOTP_SECRETS
+LOGIN_AGENT_URL  LOGIN_AGENT_URLS  LOGIN_AGENT_TOKEN  LOGIN_AGENT_TIMEOUT
+LOGIN_LOCAL_FALLBACK  LOGIN_LOCAL_HEADLESS  AGENT_ENGINE  AGENT_PROXY
+```
+
+定时任务里删掉执行主脚本的那条。
+
+### 9.6 确认清干净
+
+```bash
+systemctl status nodeseek-login-agent 2>&1 | head -3   # 应显示 not-found
+docker ps -a | grep nodeseek                           # 应无输出
+ss -lntp | grep 3000                                   # 端口不应被占
+ls -d /opt/nodeseek-autosign ~/.cache/ms-playwright 2>/dev/null   # 应无输出
+```
+
+四条都没输出就干净了。
+
+> 提醒：卸载会把 `cookie/`、`data/`、浏览器 profile 一起删掉，重装后要重新过一遍 CF 挑战，
+> 指纹也会变。只是想「重置登录状态」的话不用卸载，删 `cookie/profiles/` 下对应账号的目录就行。
+
+---
+
+## 十、说明
 
 - 本工具只做「自动点击签到」，不刷帖、不刷积分、不做任何互动行为。
 - 请遵守 NodeSeek 的站点规则；账号因自动化被封与本项目无关。
