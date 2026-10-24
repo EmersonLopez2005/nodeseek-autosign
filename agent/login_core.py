@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 from typing import Optional
 
@@ -523,14 +524,15 @@ def _signin_via_page_fetch(page, username: str, password: str):
 
 
 def _handle_email_verify(page, redirect: str, username: str):
-    """处理密码登录后的邮箱验证码二次确认。
+    """处理密码登录后的邮箱验证码二次确认（手动输入验证码版）。
 
-    NodeSeek 现在的登录是两步：密码验证通过后，redirect 到 emailSignIn.html
-    要求邮箱验证码。这里跳转到该页，dump 结构 + 抓接口线索。
+    NodeSeek 登录是两步：密码验证通过后，redirect 到 emailSignIn.html 要求
+    邮箱验证码。这里跳转到该页 → 点「发送验证码」→ 停在命令行等用户去邮箱
+    收码并输入 → 填入 Validation Code → 点登录 → 拿 sessionid。
 
-    当前为诊断版本：先 dump 出 emailSignIn 页面的输入框/按钮/接口线索，
-    为逆向验证码发送/提交接口做准备。若已配置邮箱 IMAP（NS_EMAIL +
-    NS_EMAIL_APP_PASSWORD），则尝试自动收验证码并提交。
+    之所以「停在命令行等输入」，是因为邮箱验证码是「一次性」的：完成后
+    浏览器 profile 会被 NodeSeek 记住，之后同一 profile 密码登录就免验证，
+    所以只需人工介入这一次。后续若要全自动，可换成 IMAP 自动收码。
     """
     url = redirect
     if url.startswith("/"):
@@ -542,41 +544,98 @@ def _handle_email_verify(page, redirect: str, username: str):
         _log(f"跳转邮箱验证页失败：{type(e).__name__}: {e}")
         return None
     page.wait_for_timeout(2500)
-    _dump_form_structure(page)
 
-    # 抓取页面里与验证码相关的接口线索（fetch 路径、axios 调用、表单 action）
+    # 1) 点「发送验证码」按钮，让 NodeSeek 向绑定邮箱发码
+    send_btn = None
+    for sel in ["button:has-text('发送验证码')", "button:has-text('发送')", "button:has-text('获取')"]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                send_btn = loc
+                break
+        except Exception:
+            continue
+    if send_btn is not None:
+        try:
+            send_btn.click(timeout=5000)
+            _log("已点击「发送验证码」，请到邮箱收码")
+        except Exception as e:
+            _log(f"点击发送验证码失败：{type(e).__name__}")
+    else:
+        _log("未找到「发送验证码」按钮，请确认页面已加载，手动点一下")
+
+    # 2) 停住，等用户去邮箱收码并输入
+    _log("")
+    _log("=" * 50)
+    _log("  请到绑定邮箱（[REDACTED]）查收验证码")
+    _log("  然后在下方的输入框里粘贴 6 位验证码并回车")
+    _log("=" * 50)
     try:
-        api_hints = page.evaluate(
-            """() => {
-                const hints = [];
-                // 1) 所有 script src
-                for (const s of document.querySelectorAll('script[src]')) {
-                    const src = s.getAttribute('src') || '';
-                    if (/email|sign|login|token|verify|code|account/i.test(src)) {
-                        hints.push('SCRIPT: ' + src);
-                    }
-                }
-                // 2) 表单
-                for (const f of document.querySelectorAll('form')) {
-                    hints.push('FORM: action=' + (f.getAttribute('action') || '') + ' method=' + (f.getAttribute('method') || ''));
-                }
-                // 3) 按钮文字
-                for (const b of document.querySelectorAll('button, [type=submit]')) {
-                    const t = (b.innerText || '').trim();
-                    if (t) hints.push('BTN: ' + t);
-                }
-                return hints.slice(0, 40);
-            }"""
-        )
-        if api_hints:
-            _log(f"邮箱验证页接口线索：{api_hints}")
+        code = input("请输入邮箱验证码：").strip()
+    except Exception:
+        code = ""
+    if not code:
+        _log("未输入验证码，放弃邮箱验证")
+        return None
+    if not re.fullmatch(r"\d{4,8}", code):
+        _log(f"验证码格式异常（{code!r}），应为 4-8 位数字")
+        return None
+
+    # 3) 填入 Validation Code 输入框
+    code_input = _first_visible(
+        page,
+        ["input[placeholder='Validation Code']", 'input[placeholder*="Code"]',
+         'input[placeholder*="验证码"]', 'input[autocomplete="one-time-code"]'],
+        timeout=5000,
+    )
+    if code_input is None:
+        _log("找不到验证码输入框")
+        return None
+    try:
+        code_input.click(timeout=3000)
+        code_input.fill("")
+        code_input.type(code, delay=random.randint(50, 120))
     except Exception as e:
-        _log(f"抓接口线索失败：{type(e).__name__}")
+        _log(f"填验证码失败：{type(e).__name__}")
+        try:
+            code_input.fill(code)
+        except Exception:
+            return None
+    page.wait_for_timeout(random.randint(300, 700))
 
-    _debug_dump(page, "email_verify")
+    # 4) 点「登录」提交
+    submit = None
+    for sel in ["button:has-text('登录')", "button:has-text('登 录')", "form button[type=submit]"]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                submit = loc
+                break
+        except Exception:
+            continue
+    if submit is None:
+        _log("找不到登录按钮")
+        return None
 
-    # TODO: 尝试自动收验证码（需 NS_EMAIL + NS_EMAIL_APP_PASSWORD）
-    # 当前先返回 None，让调用方抛出 NEED_EMAIL_VERIFY，下一步逆向接口后补齐。
+    try:
+        submit.click(timeout=8000)
+    except Exception as e:
+        _log(f"点击登录按钮失败：{type(e).__name__}")
+
+    # 5) 等页面跳转，检查 sessionid
+    page.wait_for_timeout(3000)
+    all_cookies = page.context.cookies()
+    cookie = cookies_to_string(all_cookies)
+    _log(f"邮箱验证后 cookie 一览：{[c['name'] for c in all_cookies]}")
+    if "sessionid=" in cookie:
+        _log("邮箱验证登录成功（已拿到 sessionid）")
+        return {"cookie": cookie, "cookies": all_cookies, "username": username}
+
+    # 没拿到 sessionid，从页面读错误提示
+    err = _read_login_error(page)
+    if err:
+        _log(f"邮箱验证未通过：{err}")
+    _debug_dump(page, "email_verify_failed")
     return None
 
 
