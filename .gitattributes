@@ -1,0 +1,8 @@
+# 统一按 LF 存储，避免 Windows 上 clone 后 shell 脚本带 CRLF 跑不起来
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.user.js text eol=lf

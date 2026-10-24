@@ -1,0 +1,28 @@
+services:
+  nodeseek-login-agent:
+    build:
+      context: .
+      args:
+        # patchright(轻) 或 camoufox(强)
+        ENGINE: patchright
+    image: nodeseek-login-agent:latest
+    container_name: nodeseek-login-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: "3000"
+      AGENT_HEADLESS: "false"   # 必须 false（配 Xvfb），无头过不了 CF
+      # 每台机器给自己的出口。如果这台机器本身就是家宽直连，删掉这一行
+      # AGENT_PROXY: "http://user:pass@127.0.0.1:7890"
+      TZ: Asia/Shanghai
+    ports:
+      # 只给内网/组网用，别直接裸奔公网
+      - "3000:3000"
+    volumes:
+      # profile / cookie / 日志都在这里，换镜像不丢指纹
+      - ./data:/app/data
+    shm_size: "1gb"
+    security_opt:
+      - seccomp=unconfined

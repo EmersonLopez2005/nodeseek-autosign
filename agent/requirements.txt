@@ -1,0 +1,17 @@
+# 登录代理依赖
+flask>=3.0.0
+requests>=2.25.0
+pyotp>=2.9.0        # 只有开了 2FA 的账号才需要
+
+# 浏览器引擎（三选一，装哪个 AGENT_ENGINE 就用哪个）
+# 1) 推荐先用 patchright：体积小、过 CF 够用
+patchright>=1.40.0
+# 2) 如果 Turnstile 老是过不去，换 camoufox（Firefox 定制版，最稳）
+# camoufox[geoip]>=0.4.11
+# 3) 最后兜底
+# playwright>=1.45.0
+
+# 装完记得下载浏览器本体：
+#   patchright install chromium
+#   python -m camoufox fetch
+#   playwright install chromium

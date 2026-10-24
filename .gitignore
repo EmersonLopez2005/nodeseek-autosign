@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+agent/.venv/
+agent/data/
+cookie/
+node_modules/

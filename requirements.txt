@@ -1,0 +1,14 @@
+# NodeSeek 自动签到 + 浏览器登录
+# 浏览器登录需要真实 Chromium，所以依赖里有 patchright
+requests>=2.25.0
+curl-cffi>=0.5.0
+flask>=3.0.0
+pyotp>=2.9.0            # 只有开 2FA 的账号需要
+
+# 浏览器引擎：patchright 体积小、过 CF 够用
+patchright>=1.40.0
+# Turnstile 一直过不去再换这个（Firefox 定制版，最稳）
+# camoufox[geoip]>=0.4.11
+
+# 装完必须下载浏览器本体（headless shell 过不了 CF，要完整版）：
+#   patchright install chromium
