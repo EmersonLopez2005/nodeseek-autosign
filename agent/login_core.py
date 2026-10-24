@@ -545,7 +545,34 @@ def _handle_email_verify(page, redirect: str, username: str):
         return None
     page.wait_for_timeout(2500)
 
-    # 1) 点「发送验证码」按钮，让 NodeSeek 向绑定邮箱发码
+    # 1) 等该页自己的 Turnstile 验证完成
+    #    emailSignIn 页面自带一个 cf-turnstile-response 组件，「发送验证码」请求
+    #    很可能要带上它的 token。之前不等待就点按钮 → 点了没反应（用户反馈）。
+    try:
+        has_ts = page.evaluate(
+            """() => {
+                if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
+                for (const fr of window.frames || []) {
+                    if (String(fr.location && fr.location.href || '').indexOf('challenges.cloudflare.com') !== -1) return true;
+                }
+                return false;
+            }"""
+        )
+    except Exception:
+        has_ts = True
+    if has_ts:
+        try:
+            _log("等待邮箱验证页的 Turnstile 组件…")
+            _wait_turnstile(page, timeout=30)
+            _log("Turnstile 已就绪")
+        except Exception as e:
+            _log(f"等待 Turnstile 出现异常（不阻塞，继续尝试发送）：{type(e).__name__}")
+    else:
+        _log("该页没有 Turnstile 组件，直接发码")
+
+    # 2) 点「发送验证码」按钮，让 NodeSeek 向绑定邮箱发码
+    #    用坐标点击（和 Turnstile 复选框一样），因为 locator.click() 在 Camoufox
+    #    下可能点到被遮挡/隐藏元素，导致「已点击」但实际没触发发信。
     send_btn = None
     for sel in ["button:has-text('发送验证码')", "button:has-text('发送')", "button:has-text('获取')"]:
         try:
@@ -557,18 +584,52 @@ def _handle_email_verify(page, redirect: str, username: str):
             continue
     if send_btn is not None:
         try:
-            send_btn.click(timeout=5000)
-            _log("已点击「发送验证码」，请到邮箱收码")
+            box = send_btn.bounding_box()
+            _log(f"「发送验证码」按钮位置：{box}")
+            if box:
+                x = box["x"] + box["width"] / 2
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y, steps=random.randint(5, 12))
+                page.wait_for_timeout(random.randint(100, 300))
+                page.mouse.down()
+                page.wait_for_timeout(random.randint(60, 140))
+                page.mouse.up()
+                _log("已点击「发送验证码」（坐标点击）")
+            else:
+                send_btn.click(timeout=5000)
+                _log("已点击「发送验证码」（locator 点击）")
         except Exception as e:
-            _log(f"点击发送验证码失败：{type(e).__name__}")
+            _log(f"点击发送验证码失败：{type(e).__name__}，请手动点一下")
     else:
         _log("未找到「发送验证码」按钮，请确认页面已加载，手动点一下")
 
-    # 2) 停住，等用户去邮箱收码并输入
+    # 3) 验证发码是否真的成功：按钮文字通常会变成「60s 后重发」之类的倒计时
+    page.wait_for_timeout(3000)
+    try:
+        btn_text = page.evaluate(
+            """() => {
+                for (const b of document.querySelectorAll('button')) {
+                    const t = (b.innerText || '').trim();
+                    if (t && /发送|重发|秒|重新/.test(t)) return t;
+                }
+                return '';
+            }"""
+        )
+        _log(f"发送后按钮状态：{btn_text!r}（若显示倒计时说明发码成功）")
+    except Exception:
+        pass
+    try:
+        _dump_form_structure(page)
+    except Exception:
+        pass
+
+    # 4) 停住，等用户去邮箱收码并输入
     _log("")
     _log("=" * 50)
-    _log("  请到绑定邮箱（[REDACTED]）查收验证码")
-    _log("  然后在下方的输入框里粘贴 6 位验证码并回车")
+    _log("  请到绑定邮箱（[REDACTED]）查收验证码邮件")
+    _log("  提示：验证码是邮件正文里的一串字母数字（实测 24 位，")
+    _log("        如 8415f1a2b52331d5a2b9078e），整段复制过来即可")
+    _log("  然后在下方粘贴验证码并回车")
     _log("=" * 50)
     try:
         code = input("请输入邮箱验证码：").strip()
@@ -577,11 +638,14 @@ def _handle_email_verify(page, redirect: str, username: str):
     if not code:
         _log("未输入验证码，放弃邮箱验证")
         return None
-    if not re.fullmatch(r"\d{4,8}", code):
-        _log(f"验证码格式异常（{code!r}），应为 4-8 位数字")
+    code = code.strip().replace(" ", "")
+    # 实测 NodeSeek 邮箱验证码是 24 位十六进制字符串（8415f1a2b52331d5a2b9078e），
+    # 所以这里只做「字母数字、无杂质」的宽松校验，不限制长度。
+    if not re.fullmatch(r"[A-Za-z0-9]{4,64}", code):
+        _log(f"验证码格式异常（{code!r}），请确认复制的是邮件正文里的那一串验证码")
         return None
 
-    # 3) 填入 Validation Code 输入框
+    # 5) 填入 Validation Code 输入框
     code_input = _first_visible(
         page,
         ["input[placeholder='Validation Code']", 'input[placeholder*="Code"]',
@@ -603,7 +667,7 @@ def _handle_email_verify(page, redirect: str, username: str):
             return None
     page.wait_for_timeout(random.randint(300, 700))
 
-    # 4) 点「登录」提交
+    # 6) 点「登录」提交
     submit = None
     for sel in ["button:has-text('登录')", "button:has-text('登 录')", "form button[type=submit]"]:
         try:
@@ -617,13 +681,30 @@ def _handle_email_verify(page, redirect: str, username: str):
         _log("找不到登录按钮")
         return None
 
+    # 坐标点击（和「发送验证码」同一个坑：locator.click() 可能点不到实位）
     try:
-        submit.click(timeout=8000)
+        box = submit.bounding_box()
+        if box:
+            x = box["x"] + box["width"] / 2
+            y = box["y"] + box["height"] / 2
+            page.mouse.move(x, y, steps=random.randint(5, 12))
+            page.wait_for_timeout(random.randint(100, 300))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(60, 140))
+            page.mouse.up()
+            _log("已点击「登录」按钮（坐标点击）")
+        else:
+            submit.click(timeout=8000)
+            _log("已点击「登录」按钮")
     except Exception as e:
         _log(f"点击登录按钮失败：{type(e).__name__}")
+        try:
+            submit.click(timeout=8000)
+        except Exception:
+            pass
 
-    # 5) 等页面跳转，检查 sessionid
-    page.wait_for_timeout(3000)
+    # 7) 等页面跳转，检查 sessionid
+    page.wait_for_timeout(3500)
     all_cookies = page.context.cookies()
     cookie = cookies_to_string(all_cookies)
     _log(f"邮箱验证后 cookie 一览：{[c['name'] for c in all_cookies]}")
@@ -635,6 +716,7 @@ def _handle_email_verify(page, redirect: str, username: str):
     err = _read_login_error(page)
     if err:
         _log(f"邮箱验证未通过：{err}")
+    _log(f"当前 URL：{page.url if hasattr(page, 'url') else '?'}")
     _debug_dump(page, "email_verify_failed")
     return None
 
