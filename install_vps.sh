@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NodeSeek 自动登录 · VPS 一键安装（Debian 11/12、Ubuntu 20.04+）
+# NodeSeek 自动登录 · VPS 一键安装（Debian 12/13、Ubuntu 22.04+）
 #
 #   bash install_vps.sh              # 装依赖 + 浏览器 + venv
 #   bash install_vps.sh --agent      # 额外注册 systemd 常驻服务（推荐给青龙用）
@@ -74,21 +74,30 @@ libgbm1 libatspi2.0-0 libx11-xcb1 libxcb1 libxext6 libxi6 libxtst6 \
 libpango-1.0-0 libcairo2 libdbus-1-3 libexpat1 libglib2.0-0 \
 fonts-noto-cjk fonts-wqy-zenhei fonts-liberation"
 
-# Ubuntu 24.04 把 libasound2 改名成 libasound2t64
-if apt-cache show libasound2 >/dev/null 2>&1; then
-  PKGS="$PKGS libasound2"
-else
-  PKGS="$PKGS libasound2t64"
+# Debian 13(trixie) / Ubuntu 24.04 改过一些包名（libasound2 → libasound2t64 等），
+# 逐个用 apt-cache 探一遍再一次性装，比批量失败后逐包重试干净
+AVAIL=""
+MISSING=""
+for p in $PKGS; do
+  if apt-cache show "$p" >/dev/null 2>&1; then
+    AVAIL="$AVAIL $p"
+  else
+    MISSING="$MISSING $p"
+  fi
+done
+if [ -n "$MISSING" ]; then
+  ylw "  这些包在当前源里没有，已跳过：$MISSING"
 fi
 
 # shellcheck disable=SC2086
-$SUDO apt-get install -y -qq --no-install-recommends $PKGS 2>&1 | grep -v '^$' | tail -3 || {
-  ylw "  批量安装有失败项，逐个补装"
-  for p in $PKGS; do
-    $SUDO apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || \
-      ylw "    跳过 $p（源里可能没有）"
-  done
-}
+$SUDO apt-get install -y -qq --no-install-recommends $AVAIL 2>&1 | grep -v '^$' | tail -3 || true
+
+# 音频库是 Chromium 硬依赖，包名各发行版不同，单独补
+if ! apt-cache show libasound2 >/dev/null 2>&1; then
+  $SUDO apt-get install -y -qq --no-install-recommends libasound2t64 >/dev/null 2>&1 || \
+    ylw "  libasound2/t64 都装不上，Chromium 可能会缺库"
+fi
+
 grn "  系统依赖完成"
 
 # ---------------------------------------------------------------- venv
@@ -150,6 +159,13 @@ Restart=always
 RestartSec=10
 # 浏览器要 fork 很多子进程，别限制太死
 LimitNOFILE=65535
+# 平时 agent 只占几十 MB；登录那 30~60 秒才吃内存。
+# 降一点优先级，别和业务抢 CPU
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# 软内存上限：超过后内核优先回收缓存，不会像 MemoryMax 那样直接杀进程
+MemoryHigh=1G
 
 [Install]
 WantedBy=multi-user.target

@@ -31,7 +31,30 @@ python3 check_env.py
 
 ---
 
-## 二、三种部署形态
+## 二、资源占用（按「尽量小」设计）
+
+浏览器**不是常驻的**，只在 cookie 失效需要登录时开一次，登录完立刻退出：
+
+| 阶段 | 内存 | CPU | 持续 |
+|---|---|---|---|
+| 常驻 agent（Flask） | 35~50 MB | 约 0 | 一直 |
+| 登录（Chromium 有头） | 峰值 400~600 MB | 瞬时 1 核 60~100% | 30~60 秒 |
+| 日常签到 | < 20 MB | 忽略 | 几秒 |
+| 环境占用（venv + Chromium） | — | — | 约 600 MB 磁盘 |
+
+省资源的具体做法：
+
+- **有 cookie 就不开浏览器**。cookie 有效期通常很长，日常签到几乎零消耗。
+- **profile 复用**。`cf_clearance` 在有效期内可以跳过挑战，连那 30 秒都省了。
+- **多账号串行**（`AGENT_MAX_CONCURRENCY=1`），不会同时开好几个 Chromium。
+- Chromium 启动参数已关掉后台网络、组件更新、同步、崩溃上报等无用子进程，但不碰 canvas / webgl / 字体（不影响指纹）。
+- Docker 侧有 `mem_limit: 1g / cpus: 1.5`，systemd 侧是 `MemoryHigh=1G` + `Nice=10`（软限制，不会直接杀进程）。
+
+所以 1 核 1G 的机器完全够用，前提是加了 swap（`install_vps.sh` 会自动判断并创建）。
+
+---
+
+## 三、三种部署形态
 
 | 形态 | 说明 | 适合 |
 |---|---|---|
@@ -43,10 +66,10 @@ python3 check_env.py
 
 ---
 
-## 三、快速开始（Deiban / Ubuntu）
+## 四、快速开始（Debian 12/13、Ubuntu 22.04+）
 
 ```bash
-git clone <本仓库地址> nodeseek-autosign
+git clone https://github.com/EmersonLopez2005/nodeseek-autosign.git
 cd nodeseek-autosign
 
 # 装系统依赖 + Chromium + venv + 生成 .env（约 3~5 分钟）
@@ -92,7 +115,7 @@ NS_USER_PASS=用户1&密码1&用户2&密码2
 
 ---
 
-## 四、多账号模式
+## 五、多账号模式
 
 一个环境变量搞定，`&` 分隔、两两一组：
 
@@ -134,7 +157,7 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 
 ---
 
-## 五、主要配置项
+## 六、主要配置项
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -152,7 +175,7 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 
 ---
 
-## 六、排错
+## 七、排错
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -169,7 +192,7 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 
 ---
 
-## 七、目录结构
+## 八、目录结构
 
 ```
 .
@@ -190,7 +213,7 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 
 ---
 
-## 八、说明
+## 九、说明
 
 - 本工具只做「自动点击签到」，不刷帖、不刷积分、不做任何互动行为。
 - 请遵守 NodeSeek 的站点规则；账号因自动化被封与本项目无关。

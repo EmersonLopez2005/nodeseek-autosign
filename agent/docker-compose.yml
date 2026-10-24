@@ -23,6 +23,17 @@ services:
     volumes:
       # profile / cookie / 日志都在这里，换镜像不丢指纹
       - ./data:/app/data
-    shm_size: "1gb"
+    shm_size: "512mb"
     security_opt:
       - seccomp=unconfined
+    # 资源上限：浏览器只在登录那 30~60 秒吃内存，平时 agent 只有几十 MB。
+    # 限制住是为了防止 Chromium 抽风把整台机器拖死。
+    # 1G 内存的小机器可以调成 800M，但要配合宿主机 swap。
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
