@@ -97,11 +97,39 @@ def _is_rule_definition_line(line: str) -> bool:
     return bool(_REGEX_SOURCE_HINT.search(line))
 
 
+def _local_literal_rules():
+    """读 .purge-secrets.local 里的字面量清单，转成规则。
+
+    这些是没有通用形状、只能精确匹配的值（裸数字 ID、具体邮箱）。
+    清单文件已被 .gitignore 排除，不进 git，因此不会变成新的泄露点。
+    """
+    path = os.path.join(ROOT, ".purge-secrets.local")
+    out = []
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                out.append((f"字面量: {line[:6]}…",
+                            re.compile(re.escape(line)), "高", True))
+    except OSError:
+        pass
+    return out
+
+
+def all_rules():
+    """全部规则 = 内置形态规则 + 本地字面量清单。"""
+    return RULES + _local_literal_rules()
+
+
 def scan_text(text: str, where: str, hits: list):
     for i, line in enumerate(text.splitlines(), 1):
         if _is_rule_definition_line(line):
             continue
-        for name, pat, level, always in RULES:
+        for name, pat, level, always in all_rules():
             for m in pat.finditer(line):
                 val = m.group(0)
                 # 长度门槛只用来滤掉误命中的碎片。
@@ -182,7 +210,7 @@ def scan_history(hits: list):
     for rev in revs:
         try:
             cmd = ["git", "grep", "-I", "-n", "-P"]
-            for _, pat, _lvl, _alw in RULES:
+            for _, pat, _lvl, _alw in all_rules():
                 cmd += ["-e", pat.pattern]
             cmd.append(rev)
             res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -213,7 +241,7 @@ def scan_history(hits: list):
             if key in seen:
                 continue
             seen.add(key)
-            for name, pat, level, always in RULES:
+            for name, pat, level, always in all_rules():
                 for m in pat.finditer(content):
                     val = m.group(0)
                     if len(val) < 20 and not always:
@@ -236,7 +264,7 @@ def scan_history(hits: list):
                                  capture_output=True, text=True, timeout=120).stdout
         except Exception:
             continue
-        for name, pat, level, always in RULES:
+        for name, pat, level, always in all_rules():
             for m in pat.finditer(out):
                 val = m.group(0)
                 if len(val) < 20 and not always:

@@ -99,11 +99,13 @@ def build_rules():
     """返回 [(名称, 正则串, 占位符)]，形态规则 + 字面量规则。"""
     rules = [(n, p, r) for n, p, r in SHAPE_RULES]
     for lit, _ph in load_literals():
-        # 字面量按字面匹配：转义后加边界，避免短数字误命中更长的数字
-        pat = r"(?<![0-9A-Za-z])" + re.escape(lit) + r"(?![0-9A-Za-z])"
+        # 字面量按字面匹配，不加数字边界断言 ——
+        # 清单是人确认过的精确值，加边界反而会漏掉
+        # 「真值是更长数字的前缀」这种形态（踩过这个坑）。
+        # re.sub 本身就是一次性非重叠替换，不会连锁。
+        pat = re.escape(lit)
         rules.append((f"字面量: {lit[:6]}…", pat, "[REDACTED]"))
     return rules
-
 
 def compile_rules(rules):
     return [(n, re.compile(p), ph) for n, p, ph in rules]

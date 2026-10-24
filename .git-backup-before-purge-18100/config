@@ -1,0 +1,14 @@
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = false
+	logallrefupdates = true
+	symlinks = false
+	ignorecase = true
+	autocrlf = false
+[user]
+	name = nodeseek-autosign
+	email = noreply@localhost
+[remote "origin"]
+	url = https://github.com/EmersonLopez2005/nodeseek-autosign.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
