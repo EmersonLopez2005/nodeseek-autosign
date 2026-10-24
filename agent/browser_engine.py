@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from typing import Optional
@@ -85,12 +86,35 @@ def _ensure_display() -> Optional[subprocess.Popen]:
 # --------------------------------------------------------------------------
 # 引擎探测
 # --------------------------------------------------------------------------
+def _camoufox_ready() -> bool:
+    """检查 Camoufox 浏览器本体是否已下载。
+
+    pip 装了 camoufox ≠ 机器上有浏览器：本体要另外 `python -m camoufox fetch`
+    （约 1.3GB，缓存在 ~/.cache/camoufox）。少了本体，引擎探测会以为可用，
+    一跑就报错，所以这里直接判死。
+    """
+    env_path = os.getenv("CAMOUFOX_PATH")
+    if env_path and os.path.exists(env_path):
+        return True
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "camoufox")
+    if os.path.isdir(cache) and os.listdir(cache):
+        return True
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "camoufox", "path"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return bool((out.stdout or "").strip())
+    except Exception:
+        return False
+
+
 def _has_camoufox() -> bool:
     try:
         import camoufox  # noqa: F401
-        return True
     except Exception:
         return False
+    return _camoufox_ready()
 
 
 def _has_patchright() -> bool:
@@ -129,8 +153,10 @@ def resolve_engine(preferred: Optional[str] = None) -> str:
         if check():
             return name
     raise RuntimeError(
-        "没有可用的浏览器引擎。请安装其中之一：\n"
-        "  pip install camoufox[geoip] && python -m camoufox fetch\n"
+        "没有可用的浏览器引擎。NodeSeek 的 Cloudflare 只认 Camoufox 的指纹，"
+        "推荐按这条装：\n"
+        "  pip install \"camoufox[geoip]\" && python -m camoufox fetch\n"
+        "备用（过 CF 成功率低）：\n"
         "  pip install patchright && patchright install chromium\n"
         "  pip install playwright && playwright install chromium"
     )

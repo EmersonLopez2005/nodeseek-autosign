@@ -1,10 +1,12 @@
 # NodeSeek 登录代理镜像
 #
 # 重要：Cloudflare 能识别 headless shell，实测无头模式下整页挑战永远过不去。
-# 所以容器里默认用 xvfb + 有头 Chromium（等价于真人在跑），这是过 CF 的关键。
+# 所以容器里默认用 xvfb + 有头浏览器（等价于真人在跑），这是过 CF 的关键。
 #
-# 想换更强过的 camoufox 引擎：
-#   docker build --build-arg ENGINE=camoufox -t nodeseek-login-agent:camoufox .
+# 默认引擎是 Camoufox（Firefox 定制版）：NodeSeek 的 CF 会把 Chromium 的
+# SwiftShader / headless 直接判成 bot，Camoufox 的指纹伪装实测能过。
+# 想换轻量 Chromium：
+#   docker build --build-arg ENGINE=patchright -t nodeseek-login-agent:chromium .
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -12,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
     DEBIAN_FRONTEND=noninteractive
 
-ARG ENGINE=patchright
+ARG ENGINE=camoufox
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl tzdata xvfb xauth \
@@ -22,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgbm1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
       libatspi2.0-0 libx11-xcb1 libxcb1 libxext6 libxi6 libxtst6 \
       libglib2.0-0 libdbus-1-3 libexpat1 libgtk-3-0 \
+      libdbus-glib-1-2 libxt6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -1,15 +1,20 @@
 # NodeSeek 自动签到 + 浏览器登录
-# 浏览器登录需要真实 Chromium，所以依赖里有 patchright
 requests>=2.25.0
 curl-cffi>=0.5.0
 python-dotenv>=1.0.0    # 读 .env（VPS 上不配这个，NS_USER_PASS 会读不到）
 flask>=3.0.0
 pyotp>=2.9.0            # 只有开 2FA 的账号需要
 
-# 浏览器引擎：patchright 体积小、过 CF 够用
-patchright>=1.40.0
-# Turnstile 一直过不去再换这个（Firefox 定制版，最稳）
-# camoufox[geoip]>=0.4.11
+# 浏览器引擎：Camoufox（Firefox 定制版）
+# 为什么是它：NodeSeek 的 Cloudflare 会把 Chromium 的 headless shell / SwiftShader
+# 直接判成 bot（NO_WEBGL、Turnstile onError），Camoufox 的指纹伪装 + WebGL 伪造
+# 实测能过。2026-10-24 VPS 上的成功日志就是 Camoufox 跑出来的。
+# [geoip] 会多装一个 GeoIP 库（按出口 IP 生成时区/语言），用代理时强烈建议。
+camoufox[geoip]>=0.4.11
 
-# 装完必须下载浏览器本体（headless shell 过不了 CF，要完整版）：
-#   patchright install chromium
+# 装完必须下载浏览器本体（约 1.3GB，缓存在 ~/.cache/camoufox）：
+#   python -m camoufox fetch
+#
+# 备用引擎（体积小，但过 Cloudflare 成功率低，装不装都不影响主流程）：
+#   patchright>=1.40.0   # 装完还要 patchright install chromium
+#   playwright>=1.45.0   # 装完还要 playwright install chromium

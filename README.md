@@ -8,26 +8,34 @@ NodeSeek 多账号自动签到。Cookie 失效时用**真实浏览器**重新登
 
 ---
 
-## 一、先搞清楚一件事：决定成败的是 IP，不是性能
+## 一、三层结构：搞清楚哪一层要什么
 
-浏览器登录只要 **1 核 1G** 就能跑（Chromium 单实例约 400~700MB）。
+NodeSeek 的登录/签到其实是三件事叠在一起，**家宽 IP 只跟第①层有关**，而且只是"让①更顺"而不是"①的门票"：
 
-真正卡人的是出口 IP 的「干净度」：
+| 层 | 内容 | 需要什么 | 需要家宽 IP？ | 多久碰一次 |
+|---|---|---|---|---|
+| ① Cloudflare 挑战 | Turnstile 组件 + FingerprintJS 指纹 | 真浏览器（**Camoufox**）+ 有头 + Xvfb | **不必须** | 只有重新登录时 |
+| ② 账号二次验证 | 邮箱动态验证码 | 绑定邮箱能收码 | 否 | 每台新设备一次 |
+| ③ 日常签到 | `POST /api/attendance` | 纯 cookie + `curl_cffi` | **完全不需要**（cookie 不绑 IP） | 每天 |
 
-| IP 类型 | 整页挑战 | Turnstile | 结论 |
-|---|---|---|---|
-| 家宽 / 住宅 / 企业宽带 | 几秒自动过 | 正常出 token | 能跑 |
-| 普通机房 VPS（搬瓦工、Vultr、阿里云…） | 大概率卡在 "Just a moment" | 组件加载不出来或无限循环 | 大概率跑不通 |
-| 少人用的原生 IP VPS | 有时能过 | 有时正常 | 需要实测 |
+**实测证据（2026-10-24）**：在一台普通机房 VPS（US-BNA，非家宽、无任何代理）上，
+Camoufox + 有头 Xvfb + 持久化 profile，一次性完成「密码登录 → 邮箱验证码 → 拿到 `session`/`pjwt`」，
+随后纯 HTTP 签到成功（"今天已完成签到"）。
 
-**别猜，跑一条命令就知道：**
+> 结论：**不需要专门买家宽机器**。家宽 IP 的真实价值是"让①更稳、降低触发风控的概率"，
+> 属于加速器/保险，不是必需品。真要加，就挂 `AGENT_PROXY`（住宅代理）当保险。
+
+**为什么以前"卡在机房 IP"**：那会儿用的是 Chromium 的 headless shell，
+Cloudflare 直接认成 bot（`NO_WEBGL` / Turnstile `onError`）——
+卡的是**指纹**，不是 IP。换成 Camoufox（指纹伪装 + WebGL 伪造）后机房 IP 也能过。
+
+**还是建议跑一下体检**（了解自己的机器，不是准入条件）：
 
 ```bash
 python3 check_env.py
 ```
 
 它会查出口 IP 的 ASN、是不是机房 IP，然后真的打开登录页走一遍挑战，最后给结论。
-看到 `IP 类型：机房/云服务器` 且挑战不过，就别在代码上折腾了，换 IP 才有用。
 
 ---
 
@@ -38,16 +46,16 @@ python3 check_env.py
 | 阶段 | 内存 | CPU | 持续 |
 |---|---|---|---|
 | 常驻 agent（Flask） | 35~50 MB | 约 0 | 一直 |
-| 登录（Chromium 有头） | 峰值 400~600 MB | 瞬时 1 核 60~100% | 30~60 秒 |
+| 登录（Camoufox 有头） | 峰值 500~800 MB | 瞬时 1 核 60~100% | 30~60 秒 |
 | 日常签到 | < 20 MB | 忽略 | 几秒 |
-| 环境占用（venv + Chromium） | — | — | 约 600 MB 磁盘 |
+| 环境占用（venv + Camoufox） | — | — | 约 2 GB 磁盘 |
 
 省资源的具体做法：
 
 - **有 cookie 就不开浏览器**。cookie 有效期通常很长，日常签到几乎零消耗。
 - **profile 复用**。`cf_clearance` 在有效期内可以跳过挑战，连那 30 秒都省了。
-- **多账号串行**（`AGENT_MAX_CONCURRENCY=1`），不会同时开好几个 Chromium。
-- Chromium 启动参数已关掉后台网络、组件更新、同步、崩溃上报等无用子进程，但不碰 canvas / webgl / 字体（不影响指纹）。
+- **多账号串行**（`AGENT_MAX_CONCURRENCY=1`），不会同时开好几个浏览器。
+- Camoufox 启动参数已关掉后台网络、组件更新、同步、崩溃上报等无用子进程，但不碰 canvas / webgl / 字体（影响指纹）。
 - Docker 侧有 `mem_limit: 1g / cpus: 1.5`，systemd 侧是 `MemoryHigh=1G` + `Nice=10`（软限制，不会直接杀进程）。
 
 所以 1 核 1G 的机器完全够用，前提是加了 swap（`install_vps.sh` 会自动判断并创建）。
@@ -60,7 +68,7 @@ python3 check_env.py
 |---|---|---|
 | **A. 全部在本机** | VPS 上直接跑脚本，浏览器也在本机 | 单台机器、IP 干净 |
 | **B. 青龙在 Docker，登录在宿主机** | 青龙调 `http://172.17.0.1:3000` | 青龙容器重建不丢浏览器环境（推荐） |
-| **C. 登录放在另一台机器** | 青龙调 `http://家宽IP:3000` | 青龙机器 IP 不干净，但有家宽机器 |
+| **C. 登录放在另一台机器** | 青龙调 `http://另一台机器IP:3000` | 想用住宅代理/家宽出口时的保险方案 |
 
 三种形态代码是同一套，只差环境变量。
 
@@ -72,25 +80,32 @@ python3 check_env.py
 git clone https://github.com/EmersonLopez2005/nodeseek-autosign.git
 cd nodeseek-autosign
 
-# 装系统依赖 + Chromium + venv + 生成 .env（约 3~5 分钟）
+# 装系统依赖 + Camoufox 浏览器 + venv + 生成 .env
+# （浏览器本体约 1.3GB，下载慢是正常的；国内机器可以挂代理再跑）
 bash install_vps.sh
 
-# 体检：先确认这台机器的 IP 行不行
+# 体检：看看这台机器的出口 IP 和挑战情况
 .venv/bin/python check_env.py
 
 # 填账号
 vi .env            # NS_USER_PASS=用户名&密码
 
-# 跑一次
+# 跑一次（首次可能会问你要邮箱验证码，输一次就记住了这台设备）
 .venv/bin/python multi_site_sign_cookie_only.py
 ```
 
 跑通了再接定时任务：
 
 ```cron
-# 每天 08:10 左右（加随机分钟，避免固定特征）
-10 8 * * * cd /opt/nodeseek-autosign && .venv/bin/python multi_site_sign_cookie_only.py >> logs/sign.log 2>&1
+# 每天 08:10（分钟数故意错开，避免固定特征）
+# flock 防止上一轮没跑完就叠一轮；日志落在项目 logs/ 下
+10 8 * * * cd /root/nodeseek-autosign && mkdir -p logs && flock -n /tmp/nodeseek-sign.lock .venv/bin/python multi_site_sign_cookie_only.py >> logs/sign.log 2>&1
 ```
+
+> **无人值守的前提**：浏览器 profile 里已经记住了这台设备（第一次手动跑过一次登录）。
+> 之后日常签到只发两个 HTTP 请求，不开浏览器、不需要验证码。
+> 万一 cookie 过期触发重新登录，而服务器又要求邮箱验证码，定时任务会因为「非交互终端」
+> 拿不到验证码而失败 —— 看到日志里的 `当前不是交互式终端` 就手动跑一次登录即可。
 
 ### 青龙在 Docker 里（形态 B）
 
@@ -231,11 +246,43 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 ## 九、卸载
 
-按你实际用过的部署方式删对应部分就行。**先停服务，再删文件**，顺序反了可能留下占着端口的残留进程。
+**最省事的做法：一键脚本**
 
-> 只是想暂停、不是彻底删：`sudo systemctl stop nodeseek-login-agent`（Docker 用 `docker compose stop`）
-> 再把定时任务注释掉就够了，文件和 profile 都留着，恢复时 `start` 一下就行。
-> profile 留着还有个好处：`cf_clearance` 和指纹不变，恢复后不用重新过挑战。
+```bash
+cd nodeseek-autosign
+
+bash uninstall.sh              # 先扫描，列出要删的一切 + 备份内容，不动文件
+bash uninstall.sh --yes        # 确认后执行
+
+# 附加选项
+bash uninstall.sh --yes --purge-system-deps   # 连 xvfb/libgtk-3 等 apt 依赖一起卸
+bash uninstall.sh --yes --with-swap          # 连 install_vps.sh 建的 1G swap 一起删
+```
+
+脚本会做这些事（顺序固定，先停后删）：
+
+1. **备份** `.env`（账号密码）和 `cookie/`（登录态）到 `/root/nodeseek-backup-<时间戳>.tar.gz`（权限 600）；
+2. 停用并删除 `nodeseek-agent.service`；
+3. 清掉 crontab 里本项目的条目；
+4. 清掉 Docker 容器与镜像；
+5. 删浏览器本体缓存（Camoufox ~1.3GB、ms-playwright 等）；
+6. 把项目目录整体移走再删（含 `.venv`、`cookie/profiles` 指纹 profile）；
+7. 系统 apt 依赖默认**保留**（别的程序可能在用），要卸加 `--purge-system-deps`。
+
+> ⚠️ 备份包里是**明文密码 + 登录 cookie**。别传到公开地方，用完记得删。
+
+**换机器部署**（备份包直接带走）：
+
+```bash
+git clone https://github.com/EmersonLopez2005/nodeseek-autosign.git
+cd nodeseek-autosign
+bash install_vps.sh                 # 装 Camoufox + venv（浏览器本体约 1.3GB）
+tar -xzf /root/nodeseek-backup-*.tar.gz -C "$PWD/"   # 恢复 .env 和 cookie
+.venv/bin/python check_env.py
+.venv/bin/python multi_site_sign_cookie_only.py
+```
+
+下面是不用脚本时的手动步骤。
 
 ### 9.1 systemd 服务（`install_vps.sh --agent` 装的）
 
@@ -268,9 +315,16 @@ crontab -l | grep -v nodeseek-autosign | crontab -
 ```bash
 rm -rf /opt/nodeseek-autosign      # 换成你实际 clone 的路径
 
-# Chromium 本体约 180MB，patchright / playwright 共用这个缓存目录
-du -sh ~/.cache/ms-playwright ~/.cache/patchright 2>/dev/null   # 先看看占了多大
-rm -rf ~/.cache/ms-playwright ~/.cache/patchright
+# Camoufox 本体约 1.3GB（实测在用的就是它）
+du -sh ~/.cache/camoufox ~/.cache/ms-playwright ~/.cache/patchright 2>/dev/null
+rm -rf ~/.cache/camoufox ~/.cache/ms-playwright ~/.cache/patchright
+```
+
+**只想清浏览器、保留项目**用这个：
+
+```bash
+bash cleanup_browsers.sh            # 扫描并列出可清理项
+bash cleanup_browsers.sh --yes      # 确认后删
 ```
 
 如果安装脚本给你建过 swap：
@@ -299,10 +353,10 @@ LOGIN_LOCAL_FALLBACK  LOGIN_LOCAL_HEADLESS  AGENT_ENGINE  AGENT_PROXY
 ### 9.6 确认清干净
 
 ```bash
-systemctl status nodeseek-login-agent 2>&1 | head -3   # 应显示 not-found
-docker ps -a | grep nodeseek                           # 应无输出
-ss -lntp | grep 3000                                   # 端口不应被占
-ls -d /opt/nodeseek-autosign ~/.cache/ms-playwright 2>/dev/null   # 应无输出
+systemctl status nodeseek-agent 2>&1 | head -3   # 应显示 not-found
+docker ps -a | grep nodeseek                      # 应无输出
+ss -lntp | grep 3000                              # 端口不应被占
+ls -d /opt/nodeseek-autosign ~/.cache/camoufox ~/.cache/ms-playwright 2>/dev/null   # 应无输出
 ```
 
 四条都没输出就干净了。

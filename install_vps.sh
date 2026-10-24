@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # NodeSeek 自动登录 · VPS 一键安装（Debian 12/13、Ubuntu 22.04+）
 #
-#   bash install_vps.sh              # 装依赖 + 浏览器 + venv
-#   bash install_vps.sh --agent      # 额外注册 systemd 常驻服务（推荐给青龙用）
-#   bash install_vps.sh --check      # 只体检，不安装
+#   bash install_vps.sh                      # 装依赖 + 浏览器(Camoufox) + venv
+#   bash install_vps.sh --engine=patchright   # 改用体积小的 Chromium 引擎（过 CF 成功率低）
+#   bash install_vps.sh --agent               # 额外注册 systemd 常驻服务（推荐给青龙用）
+#   bash install_vps.sh --check               # 只体检，不安装
+#   bash install_vps.sh --cleanup-browsers    # 只扫描并清理这台机器上多余的浏览器
 #
-# 设计说明：有头浏览器是过 Cloudflare 的前提，所以装的是完整 Chromium + Xvfb，
-# 不是 headless shell。浏览器体积约 180MB，装完整个环境约 600MB 磁盘。
+# 设计说明：
+#   - 引擎默认 Camoufox（Firefox 定制版）。NodeSeek 的 Cloudflare 会把 Chromium 的
+#     headless shell / SwiftShader 直接判成 bot，只有 Camoufox 的指纹伪装实测能过。
+#   - 必须有头（headless=False）+ Xvfb，headless 一定过不了整页挑战。
+#   - 磁盘占用：Camoufox 约 1.3GB；换成 patchright 约 200MB。
 
 set -euo pipefail
 
@@ -14,6 +19,17 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$APP_DIR/.venv"
 PY="$VENV/bin/python"
 MODE="${1:-}"
+ENGINE="camoufox"
+
+for arg in "$@"; do
+  case "$arg" in
+    --engine=*) ENGINE="${arg#*=}" ;;
+  esac
+done
+case "$ENGINE" in
+  camoufox|patchright|playwright) ;;
+  *) echo "未知引擎：$ENGINE（可选 camoufox / patchright / playwright）" >&2; exit 1 ;;
+esac
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -38,6 +54,11 @@ if [ "$MODE" = "--check" ]; then
     python3 "$APP_DIR/check_env.py" --skip-browser
   fi
   exit 0
+fi
+
+# 清理模式交给独立脚本，别把两件事混在一个安装流程里
+if [ "$MODE" = "--cleanup-browsers" ]; then
+  exec bash "$APP_DIR/cleanup_browsers.sh" "${@:2}"
 fi
 
 step "系统信息"
@@ -123,14 +144,37 @@ fi
 grn "  Python 依赖完成"
 
 # ---------------------------------------------------------------- 浏览器
-step "安装 Chromium（完整版，不是 headless shell）"
-"$VENV/bin/patchright" install chromium 2>&1 | tail -2 || {
-  red "  Chromium 下载失败，检查磁盘空间或网络（约需 200MB）"
-  exit 1
-}
-# 顺手装上系统依赖，官方脚本最清楚缺什么
-"$VENV/bin/patchright" install-deps chromium >/dev/null 2>&1 || true
-grn "  Chromium 完成"
+step "安装浏览器引擎：$ENGINE"
+if [ "$ENGINE" = "camoufox" ]; then
+  # Camoufox：Firefox 定制版，过 CF 最稳。浏览器本体约 1.3GB。
+  "$PY" -m pip install -q -U "camoufox[geoip]" || {
+    red "  camoufox 安装失败，检查 pip 网络"
+    exit 1
+  }
+  ylw "  正在下载 Camoufox 浏览器本体（约 1.3GB，慢是正常的，断了重跑本脚本即可续上）…"
+  "$PY" -m camoufox fetch 2>&1 | tail -3 || {
+    red "  Camoufox 浏览器下载失败，检查磁盘空间（需要 ≥3GB 可用）或网络"
+    exit 1
+  }
+  if ! "$PY" -m camoufox path >/dev/null 2>&1; then
+    red "  Camoufox 浏览器校验失败（可能没装全），重跑：$PY -m camoufox fetch"
+    exit 1
+  fi
+  grn "  Camoufox 完成（指纹伪装版 Firefox）"
+else
+  # 备用：Chromium 系。体积小，但 NodeSeek 的 CF 对它更凶，成功率低。
+  if [ "$ENGINE" = "patchright" ]; then
+    "$PY" -m pip install -q -U "patchright>=1.40.0"
+    "$VENV/bin/patchright" install chromium 2>&1 | tail -2 || {
+      red "  Chromium 下载失败，检查磁盘空间或网络（约需 200MB）"; exit 1; }
+    "$VENV/bin/patchright" install-deps chromium >/dev/null 2>&1 || true
+  else
+    "$PY" -m pip install -q -U "playwright>=1.45.0"
+    "$VENV/bin/playwright" install chromium 2>&1 | tail -2 || {
+      red "  Chromium 下载失败，检查磁盘空间或网络（约需 200MB）"; exit 1; }
+  fi
+  grn "  $ENGINE 完成（注意：NodeSeek 的 CF 对 Chromium 更凶，可能过不了 Turnstile）"
+fi
 
 # ---------------------------------------------------------------- .env
 step "初始化配置"
@@ -138,10 +182,12 @@ if [ ! -f "$APP_DIR/.env" ]; then
   cp "$APP_DIR/.env.example" "$APP_DIR/.env"
   TOKEN="$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
   sed -i "s|^AGENT_TOKEN=.*|AGENT_TOKEN=$TOKEN|" "$APP_DIR/.env" 2>/dev/null || true
+  sed -i "s|^#*AGENT_ENGINE=.*|AGENT_ENGINE=$ENGINE|" "$APP_DIR/.env" 2>/dev/null || true
   grn "  已生成 .env，AGENT_TOKEN=$TOKEN"
+  grn "  引擎：AGENT_ENGINE=$ENGINE"
   ylw "  记得在里面填 NS_USER_PASS=用户名&密码"
 else
-  ylw "  .env 已存在，跳过"
+  ylw "  .env 已存在，跳过（引擎按 .env 里的 AGENT_ENGINE 走）"
 fi
 chmod 600 "$APP_DIR/.env" 2>/dev/null || true
 
@@ -151,6 +197,9 @@ if [ "$MODE" = "--agent" ]; then
   TOKEN="$(grep -E '^AGENT_TOKEN=' "$APP_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' )"
   PORT="$(grep -E '^AGENT_PORT=' "$APP_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"')"
   PORT="${PORT:-3000}"
+  # .env 里显式写了 AGENT_ENGINE 就用它，否则用本次安装的引擎
+  ENV_ENGINE="$(grep -E '^AGENT_ENGINE=' "$APP_DIR/.env" | head -1 | cut -d= -f2- | tr -d '" ')"
+  ENV_ENGINE="${ENV_ENGINE:-$ENGINE}"
 
   cat > /tmp/nodeseek-agent.service <<EOF
 [Unit]
@@ -162,7 +211,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$APP_DIR
 Environment=AGENT_TOKEN=$TOKEN
-Environment=AGENT_ENGINE=patchright
+Environment=AGENT_ENGINE=$ENV_ENGINE
 Environment=AGENT_HEADLESS=false
 Environment=HOME=/root
 Environment=DISPLAY=

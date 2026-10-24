@@ -360,13 +360,13 @@ def summary():
     hosting = results.get("hosting")
 
     if not eng:
-        say(BAD, "没有可用浏览器引擎，先按 README 装 patchright。")
+        say(BAD, "没有可用浏览器引擎，先按 README 装 camoufox：pip install \"camoufox[geoip]\" && python -m camoufox fetch")
         return
 
     if ch in ("ok", "widget_ok"):
         say(OK, "这台机器可以用：整页挑战通过，Turnstile 组件正常。")
         say(OK, "下一步实测真账号：")
-        say(OK, "  AGENT_ENGINE=patchright AGENT_HEADLESS=false \\")
+        say(OK, "  AGENT_ENGINE=camoufox AGENT_HEADLESS=false \\")
         say(OK, "  .venv/bin/python agent/nodeseek_login_agent.py --once \\")
         say(OK, "      --user 用户名 --password '密码'")
         return

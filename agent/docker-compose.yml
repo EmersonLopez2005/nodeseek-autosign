@@ -3,8 +3,8 @@ services:
     build:
       context: .
       args:
-        # patchright(轻) 或 camoufox(强)
-        ENGINE: patchright
+        # camoufox(默认，实测能过 CF) / patchright(轻但过 CF 成功率低)
+        ENGINE: camoufox
     image: nodeseek-login-agent:latest
     container_name: nodeseek-login-agent
     restart: unless-stopped

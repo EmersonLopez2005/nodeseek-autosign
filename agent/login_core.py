@@ -81,6 +81,27 @@ def _log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# 调试开关：NS_DEBUG=1 时才打印「排查用」的详细信息。
+# 默认关闭——日常签到日志要一眼看得出「成功没成功」，不该被指纹/表单 dump 淹没。
+# 需要排查站点改版时：NS_DEBUG=1 python3 multi_site_sign_cookie_only.py
+DEBUG = os.getenv("NS_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dbg(msg: str):
+    """仅调试模式打印。"""
+    if DEBUG:
+        print(f"[{time.strftime('%H:%M:%S')}] [debug] {msg}", flush=True)
+
+
+def _cookie_names(cookies) -> str:
+    """把 cookie 列表压成一行短文本，只留关键字段。"""
+    names = [c.get("name") for c in cookies or []]
+    keys = [n for n in names if n in AUTH_COOKIE_NAMES or n == "cf_clearance"]
+    others = [n for n in names if n not in keys]
+    tail = f" +{len(others)}个" if others else ""
+    return (",".join(keys) + tail) if keys else ",".join(names)
+
+
 def _probe_webgl(page):
     """把 WebGL 渲染器打进日志 —— 一锤定音的指纹证据。
 
@@ -88,6 +109,8 @@ def _probe_webgl(page):
     会被 Turnstile onError 直接拒绝）；
     装了 libgl1-mesa-dri 后是 "llvmpipe"，是正常桌面会有的值。
     连 WebGL 都没有（NO_WEBGL）说明 GPU 进程没起来，往往缺 libegl1/libgles2。
+
+    注意：正常值只在调试模式打印；只有「异常值」才值得占用日志行。
     """
     try:
         r = page.evaluate(
@@ -104,18 +127,18 @@ def _probe_webgl(page):
         )
         r = (r or "").strip()
         if "swiftshader" in r.lower():
-            _log(f"WebGL 渲染器：{r}  ← CF 已知 bot 特征，执行：apt install -y libgl1 libgl1-mesa-dri")
+            _log(f"⚠️ WebGL 渲染器：{r}  ← CF 已知 bot 特征，执行：apt install -y libgl1 libgl1-mesa-dri")
         elif r in ("NO_WEBGL", "NO_EXT", "ERR", "") or r.startswith("ERR_"):
-            _log(f"WebGL 渲染器：{r}  ← 浏览器完全没有 WebGL！GPU 进程没起来。"
+            _log(f"⚠️ WebGL 渲染器：{r}  ← 浏览器完全没有 WebGL！GPU 进程没起来。"
                  f"先试：apt install -y libegl1 libgles2；仍无效就换 AGENT_ENGINE=camoufox")
         else:
-            _log(f"WebGL 渲染器：{r}")
+            _dbg(f"WebGL 渲染器：{r}")
     except Exception as e:
-        _log(f"WebGL 探测异常：{type(e).__name__}")
+        _dbg(f"WebGL 探测异常：{type(e).__name__}")
 
 
 def _dump_gpu_info(page):
-    """更深的 GPU 诊断：Chromium 内部看到的 GL 实现与 GPU 特性。"""
+    """更深的 GPU 诊断（仅调试模式）：Chromium 内部看到的 GL 实现与 GPU 特性。"""
     try:
         info = page.evaluate(
             """() => {
@@ -136,9 +159,9 @@ def _dump_gpu_info(page):
                 return out;
             }"""
         )
-        _log(f"GPU 详情：{info}")
+        _dbg(f"GPU 详情：{info}")
     except Exception as e:
-        _log(f"GPU 详情获取失败：{type(e).__name__}")
+        _dbg(f"GPU 详情获取失败：{type(e).__name__}")
 
 
 def _first_visible(page, selectors, timeout=8000):
@@ -365,7 +388,7 @@ def _wait_turnstile(page, timeout=40):
             _log(f"Turnstile 验证通过（{len(tok)} 字符）")
             return tok
         if state == "success":
-            _log(f"Turnstile 组件已通过（{time.time() - start:.0f}s），但没读到 token，继续等")
+            _dbg(f"Turnstile 组件已通过（{time.time() - start:.0f}s），但没读到 token，继续等")
         elif tok:
             # 有 token 但组件状态不是 success：可能是状态误判。
             # 若同一个 token 连续多轮稳定存在，说明验证其实已经完成、token 新鲜，
@@ -373,16 +396,16 @@ def _wait_turnstile(page, timeout=40):
             if tok == last_tok:
                 tok_stable += 1
                 if tok_stable >= 3 and time.time() - start > 6:
-                    _log(f"token 已稳定存在 {tok_stable} 轮（组件状态 {state} 可能误判），按验证通过处理")
+                    _dbg(f"token 已稳定存在 {tok_stable} 轮（组件状态 {state} 可能误判），按验证通过处理")
                     return tok
             else:
                 tok_stable = 1
                 last_tok = tok
             if state != last_state:
-                _log(f"已有 token（{_turnstile_token_detail(page)}）但组件状态为 {state}，等待组件确认…")
+                _dbg(f"已有 token 但组件状态为 {state}，等待组件确认…")
             last_state = state
         elif state != last_state:
-            _log(f"Turnstile 组件状态：{state}")
+            _dbg(f"Turnstile 组件状态：{state}")
             last_state = state
 
         if "人机验证服务加载失败" in _body_text(page):
@@ -406,11 +429,11 @@ def _wait_turnstile(page, timeout=40):
             if ok:
                 clicked = 1
                 page.wait_for_timeout(600)
-                _log(f"点击后状态：{turnstile_state(page)}")
+                _dbg(f"点击后状态：{turnstile_state(page)}")
             else:
-                _log("没定位到 Turnstile 组件，3 秒后重试点击")
+                _dbg("没定位到 Turnstile 组件，3 秒后重试点击")
         elif state == "error" and clicked < 2 and time.time() - last_click > 10:
-            _log("Turnstile 报错，重新点一次")
+            _dbg("Turnstile 报错，重新点一次")
             _click_turnstile_checkbox(page)
             clicked += 1
             last_click = time.time()
@@ -706,7 +729,7 @@ def _handle_email_verify(page, redirect: str, username: str):
     if send_btn is not None:
         try:
             box = send_btn.bounding_box()
-            _log(f"「发送验证码」按钮位置：{box}")
+            _dbg(f"「发送验证码」按钮位置：{box}")
             if box:
                 x = box["x"] + box["width"] / 2
                 y = box["y"] + box["height"] / 2
@@ -904,7 +927,7 @@ def _handle_email_verify(page, redirect: str, username: str):
         if url_now and "emailSignIn" not in url_now:
             left_email_page = True
 
-    _log(f"邮箱验证后 cookie 一览：{[c['name'] for c in all_cookies]}")
+    _log(f"邮箱验证后 cookie：{_cookie_names(all_cookies)}")
     _log(f"当前 URL：{page.url if hasattr(page, 'url') else '?'}")
     if auth_ok:
         # 再用一次真实接口确认（cookie 名可能变，接口不会骗人）
@@ -924,7 +947,7 @@ def _handle_email_verify(page, redirect: str, username: str):
         if verified is True:
             all_cookies = page.context.cookies()
             cookie = cookies_to_string(all_cookies)
-            _log(f"接口确认已登录，cookie 一览：{[c['name'] for c in all_cookies]}")
+            _log(f"接口确认已登录，cookie：{_cookie_names(all_cookies)}")
             return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
     # 没拿到登录态：把服务器原文打出来，看它到底说了什么
@@ -1050,7 +1073,7 @@ def _read_login_error(page) -> Optional[str]:
     except Exception:
         pass
     if "/board" in url or "/home" in url:
-        _log(f"页面已跳转到 {url}（可能登录成功）")
+        _dbg(f"页面已跳转到 {url}（可能登录成功）")
     try:
         err = page.evaluate(
             """() => {
@@ -1342,11 +1365,11 @@ def _dump_form_structure(page):
             }"""
         )
         if info:
-            _log(f"登录页输入框：{info.get('inputs')}")
-            _log(f"登录页链接：{info.get('links')}")
-            _log(f"登录页按钮：{info.get('btns')}")
+            _dbg(f"登录页输入框：{info.get('inputs')}")
+            _dbg(f"登录页链接：{info.get('links')}")
+            _dbg(f"登录页按钮：{info.get('btns')}")
     except Exception as e:
-        _log(f"表单结构 dump 失败：{type(e).__name__}")
+        _dbg(f"表单结构 dump 失败：{type(e).__name__}")
 
 
 def login(page, username: str, password: str, totp_secret: Optional[str] = None,
@@ -1374,7 +1397,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
 
     # 登录表单可能是异步渲染的，dump 之后再多等一会儿，让表单真正加载出来
     page.wait_for_timeout(3000)
-    _log("等待登录表单渲染后再次 dump…")
+    _dbg("等待登录表单渲染后再次 dump…")
     _dump_form_structure(page)
 
     # 有些版本的登录页默认是“邮箱验证码”模式，需要切到密码模式
@@ -1397,7 +1420,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
 
     # 诊断：打印匹配到的用户名/密码框的真实属性，确认没有误匹配到搜索框
     try:
-        _log(f"匹配到的用户名框：{user_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
+        _dbg(f"匹配到的用户名框：{user_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
     except Exception:
         pass
 
@@ -1410,7 +1433,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         if pwd_input is None:
             raise LoginError("PAGE_ERROR", "登录页找不到密码输入框")
         try:
-            _log(f"匹配到的密码框：{pwd_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
+            _dbg(f"匹配到的密码框：{pwd_input.evaluate('el => ({id: el.id, name: el.name, type: el.type, ph: el.placeholder})')}")
         except Exception:
             pass
 
@@ -1477,7 +1500,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         page.wait_for_timeout(2500)
         all_cookies = page.context.cookies()
         cookie = cookies_to_string(all_cookies)
-        _log(f"提交后 cookie 一览：{[c['name'] for c in all_cookies]}")
+        _log(f"提交后 cookie：{_cookie_names(all_cookies)}")
         if _auth_cookie_present(all_cookies):
             verified = _verify_authenticated(page)
             if verified is False:
@@ -1548,7 +1571,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 page.wait_for_timeout(2500)
                 all_cookies = page.context.cookies()
                 cookie = cookies_to_string(all_cookies)
-                _log(f"刷新后 cookie 一览：{[c['name'] for c in all_cookies]}")
+                _log(f"刷新后 cookie：{_cookie_names(all_cookies)}")
                 if _auth_cookie_present(all_cookies):
                     _log("登录成功（刷新后拿到登录态 cookie）")
                     return {"cookie": cookie, "cookies": all_cookies, "username": username}
@@ -1624,7 +1647,7 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         except Exception:
             pass
         if "emailSignIn" in cur_url or "email" in cur_url.lower():
-            _log("检测到跳转到邮箱登录页，dump 该页结构：")
+            _dbg("检测到跳转到邮箱登录页，dump 该页结构：")
             _dump_form_structure(page)
             _debug_dump(page, "email_signin")
 
