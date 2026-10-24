@@ -27,3 +27,7 @@ agent/data/
 node_modules/
 .DS_Store
 *.log
+
+# ---- 清历史工具的备份目录（含未清理的 .git，绝不能提交）----
+.git-backup-before-purge-*/
+purge_history.pyc

@@ -312,7 +312,10 @@ def main():
         return 0
 
     print("\n== 准备备份 ==")
-    bak = os.path.join(ROOT, f".git-backup-before-purge-{os.getpid()}")
+    # 备份放到系统临时目录，不放仓库内 ——
+    # 仓库内的备份目录含未清理的 .git，一旦被 git add -A 就会把旧密钥提交回去。
+    bak_dir = tempfile.mkdtemp(prefix="nodeseek-purge-backup-")
+    bak = os.path.join(bak_dir, "git-backup")
     try:
         shutil.copytree(os.path.join(ROOT, ".git"), bak)
         print(f"  已备份 .git 到 {bak}")
@@ -360,7 +363,7 @@ def main():
 
     print("\n== 收尾 ==")
     print("  1. 到 GitHub 仓库页 →「安全和质量」→「密钥扫描」→ 把告警标成「已解决」")
-    print(f"  2. 删掉本地备份：rm -rf {bak}")
+    print(f"  2. 删掉本地备份：rm -rf {bak_dir}")
     print(f"  3. 别的机器 clone 过的话：git fetch origin && git reset --hard origin/{branch}")
     return 0
 
