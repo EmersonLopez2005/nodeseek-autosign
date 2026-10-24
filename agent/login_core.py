@@ -574,30 +574,30 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         except Exception as e:
             last_msg = f"提交后未拿到接口响应（{type(e).__name__}）"
             _log(last_msg)
-            # 多半是 Turnstile 还没算完，按钮提交被前端拦住。
-            # 不要原地重复点复选框（会取消验证），重新加载页面从头来一次。
             if attempt < max_attempts:
                 _log("重新加载登录页后重试")
                 user_input = _reload_login_page(page)
             continue
 
-        try:
-            data = resp.json()
-        except Exception:
-            body = (resp.text() or "")[:300]
-            last_msg = f"登录接口返回非 JSON（HTTP {resp.status}）：{body}"
-            _log(last_msg)
-            continue
-
-        if data.get("success"):
-            cookie = cookies_to_string(page.context.cookies())
-            if "sessionid=" not in cookie:
-                raise LoginError("NO_COOKIE", f"接口返回成功但没拿到 sessionid：{cookie[:200]}")
-            _log("登录成功")
+        # 登录接口成功与否，不靠读响应体判断——登录成功后页面会立刻跳转，
+        # 响应体随即被浏览器丢弃（Camoufox/Firefox 下读 body 会报
+        # NS_ERROR_INVALID_CONTENT_ENCODING）。真正的判据是 cookie 里有没有 sessionid。
+        page.wait_for_timeout(2500)
+        cookie = cookies_to_string(page.context.cookies())
+        if "sessionid=" in cookie:
+            _log("登录成功（已拿到 sessionid）")
             return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
 
+        # 没有 sessionid，才尝试读接口响应判断失败原因（可能页面还没跳转）
+        status = None
+        try:
+            status = resp.status
+            data = resp.json()
+        except Exception:
+            data = None
+
         # 2FA
-        if data.get("need2FA"):
+        if data and data.get("need2FA"):
             otp_session = data.get("otpSession", "")
             if not totp_secret:
                 raise LoginError(
@@ -627,7 +627,9 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
             raise LoginError("NEED_2FA", "2FA 验证未通过，请检查 TOTP 密钥是否正确")
 
-        last_msg = data.get("message") or str(data)[:200]
+        last_msg = (data or {}).get("message") if isinstance(data, dict) else (str(data)[:200] if data else f"HTTP {status}")
+        if not last_msg:
+            last_msg = f"HTTP {status}（响应体已被浏览器丢弃，但也没拿到 sessionid）"
         _log(f"登录失败：{last_msg}")
 
         low = last_msg.lower()
