@@ -107,6 +107,7 @@ NS_USER_PASS=alice&alice_pass&bob&bob_pass&carol&carol_pass
 |---|---|
 | 浏览器 profile | `cookie/profiles/<用户名>/`，指纹、cf_clearance、localStorage 各自独立 |
 | cookie 缓存 | `cookie/<站点>_<序号>.json` |
+| 2FA 密钥 | `NS_TOTP_SECRETS=alice:KEY1&bob:KEY2` 按用户名匹配 |
 | 失败隔离 | 一个账号登录失败不会中断其他账号，最后汇总结果 |
 | 通知 | 一条汇总消息，标明哪个账号失败 |
 

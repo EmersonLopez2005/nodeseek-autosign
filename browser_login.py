@@ -104,6 +104,22 @@ def _pick_agent(account: str) -> list:
     return urls[idx:] + urls[:idx]
 
 
+def _totp_for(user: str):
+    """多账号 2FA：NS_TOTP_SECRETS=alice:BASE32&bob:BASE32 按用户名匹配。
+
+    只开了一个账号 2FA 时可以继续用全局的 NS_TOTP_SECRET。
+    """
+    table = os.getenv("NS_TOTP_SECRETS", "").strip()
+    if table:
+        for item in table.replace("&", ",").split(","):
+            if ":" not in item:
+                continue
+            name, secret = item.split(":", 1)
+            if name.strip().lower() == (user or "").strip().lower():
+                return secret.strip() or None
+    return os.getenv("NS_TOTP_SECRET") or None
+
+
 def browser_login(site_config, user, pwd, headless=True):
     """返回 cookie 字符串；失败返回 None。签名与主脚本里的调用保持一致。"""
     if not user or not pwd:
@@ -119,11 +135,14 @@ def browser_login(site_config, user, pwd, headless=True):
 
     site = site_config.get("type", "nodeseek")
     token = os.getenv("LOGIN_AGENT_TOKEN", "").strip()
+    totp_secret = _totp_for(user)
 
     # ---------- A. 远程 agent ----------
     errors = []
     for base in _pick_agent(user):
         payload = {"site": site, "account": user, "username": user, "password": pwd}
+        if totp_secret:
+            payload["totp_secret"] = totp_secret
         r = _post_json(f"{base}/login", payload, token=token)
         if r.get("ok") and r.get("cookie"):
             print(f"[browser_login] {base} 登录成功（{r.get('cost', '?')}s）")
@@ -147,8 +166,7 @@ def browser_login(site_config, user, pwd, headless=True):
                 user_data_dir=profile,
                 proxy=os.getenv("AGENT_PROXY", ""),
             ) as page:
-                result = login_core.login(page, user, pwd,
-                                          totp_secret=os.getenv("NS_TOTP_SECRET") or None)
+                result = login_core.login(page, user, pwd, totp_secret=totp_secret)
             print("[browser_login] 本地浏览器登录成功")
             return result["cookie"]
         except Exception as e:
