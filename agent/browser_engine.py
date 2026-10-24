@@ -214,22 +214,27 @@ def browser_page(
 def _camoufox_page(headless, user_data_dir, proxy_cfg, locale, humanize):
     from camoufox.sync_api import Camoufox
 
+    # Camoufox 新版要求：持久化 profile 必须 user_data_dir + persistent_context=True。
+    # 不用 user_data_dir 时走普通 launch（浏览器每次新建，指纹随机）。
+    # headless="virtual" 用 Camoufox 内置的 Xvfb，比外部 xvfb-run 更省事；
+    # 但我们已经在 browser_page 里起好 Xvfb 了，这里 headless=False 即可。
     kwargs = dict(
         headless=headless,
         humanize=humanize,
         locale=[locale, "zh"],
-        user_data_dir=user_data_dir,
-        proxy=proxy_cfg,
-        os=["windows"],
-        # 关掉一些非必要的数据上报，Docker 里更稳
+        # 不设 os，让 Camoufox 按真实 Linux 环境生成自洽指纹；
+        # 设死 windows 反而会和真实 UA/字体对不上，产生指纹泄漏
         geoip=False,
+        # 关键：禁用 COOP，否则跨域 iframe 里的 Turnstile 复选框点不到
+        disable_coop=True,
     )
-    try:
-        cm = Camoufox(**kwargs)
-    except TypeError:
-        # 老版本 camoufox 没有某些参数，退到最小集合
-        cm = Camoufox(headless=headless, user_data_dir=user_data_dir, proxy=proxy_cfg)
+    if user_data_dir:
+        kwargs["user_data_dir"] = user_data_dir
+        kwargs["persistent_context"] = True
+    if proxy_cfg:
+        kwargs["proxy"] = proxy_cfg
 
+    cm = Camoufox(**kwargs)
     with cm as browser:
         page = browser.new_page()
         try:
