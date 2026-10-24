@@ -16,23 +16,36 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# 每条规则：(名称, 正则, 严重级别)
+# 每条规则：(名称, 正则, 严重级别, 是否无视「示例上下文」)
+#
+# 第四个字段 always_report 的含义：这种格式本身足够独特，
+# 只要匹配上就值得报出来，不管上下文有没有写「例：」「示例」。
+#
+# 为什么需要它：上游源码里最常见的泄露形态就是
+#   'TG_BOT_TOKEN': '',   # 例：<真实token>
+# 注释写着「例：」，但值是真的。早期版本靠上下文判断占位符，
+# 结果这类行被整行放过 —— 假阴性，恰恰漏掉了最该报的。
+#
 # 说明：这些模式都做了「排除已知占位符」的处理，避免把 .env.example 里的空值当泄露。
 RULES = [
-    ("Telegram Bot Token", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b"), "高"),
-    ("钉钉机器人 access_token", re.compile(r"access_token=[A-Za-z0-9]{20,}"), "高"),
-    ("企业微信 webhook", re.compile(r"https://qyapi\.weixin\.qq\.com/cgi-bin/webhook/send\?key=[A-Za-z0-9-]{20,}"), "高"),
-    ("Server酱 SendKey", re.compile(r"\bSQ[A-Za-z0-9]{20,}\b"), "高"),
-    ("PushPlus Token", re.compile(r"\b[0-9a-f]{32}\b(?=.{0,40}pushplus)"), "中"),
-    ("GitHub PAT", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"), "高"),
-    ("AWS Access Key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "高"),
-    ("私钥块", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"), "高"),
-    ("NodeSeek 登录态 cookie", re.compile(r"\b(?:pjwt|session|cf_clearance)=[A-Za-z0-9%_.-]{25,}"), "高"),
+    ("Telegram Bot Token", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b"), "高", True),
+    # 半截 token：数字ID + 短尾巴（例：注释里写「例：[REDACTED_TG_TOKEN]...」）。
+    # 完整规则要求尾巴 30+ 位，这种短尾巴匹配不上 → 漏报。踩过这个坑。
+    ("Telegram Bot Token(短尾)", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{3,}\b"), "高", True),
+    ("钉钉机器人 access_token", re.compile(r"access_token=[A-Za-z0-9]{20,}"), "高", True),
+    ("企业微信 webhook", re.compile(r"https://qyapi\.weixin\.qq\.com/cgi-bin/webhook/send\?key=[A-Za-z0-9-]{20,}"), "高", True),
+    ("Server酱 SendKey", re.compile(r"\bSQ[A-Za-z0-9]{20,}\b"), "高", True),
+    ("PushPlus Token", re.compile(r"\b[0-9a-f]{32}\b(?=.{0,40}pushplus)"), "中", True),
+    ("GitHub PAT", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"), "高", True),
+    ("AWS Access Key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "高", True),
+    ("私钥块", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"), "高", True),
+    ("NodeSeek 登录态 cookie", re.compile(r"\b(?:pjwt|session|cf_clearance)=[A-Za-z0-9%_.-]{25,}"), "高", True),
 ]
 
 # 这些是明显的占位/示例值，不算泄露。
 # 注意：判断的是「匹配到的值本身」，不是整行 —— 整行判断会漏掉最危险的一类：
-#   'TG_BOT_TOKEN': '',   # 例：[REDACTED_TG_TOKEN]...   ← 注释里写「例：」但值是真的
+#   'TG_BOT_TOKEN': '',   # 例：<数字ID>:<字母数字串>   ← 注释里写「例：」但值是真的
+# （这里刻意不写真实样例：写出来就会变成新的泄露点，还会被 secret scanning 命中）
 PLACEHOLDER_VALUES = {
     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "your_token_here", "changeme", "placeholder",
 }
@@ -42,17 +55,24 @@ PLACEHOLDER_PAT = re.compile(
 )
 
 
-def _value_is_placeholder(val: str, ctx: str) -> bool:
+def _value_is_placeholder(val: str, ctx: str, always_report: bool = False) -> bool:
     """判断命中的这个值是不是占位符。
 
-    只看值本身 + 它紧邻的上下文（前后 40 字符），不看整行 ——
-    否则「# 例：<真实token>」这种行会被整行判定为占位符而漏报。
+    三层判定，从严到松：
+      1. 值本身就是明显的占位（xxx / your_token_here / <token>…）→ 放过
+      2. 规则标记了 always_report（格式足够独特）→ 一定报出来
+      3. 上下文里有「例：」「示例」这类提示词，且值本身像样例 → 放过
+
+    第 2 条是关键：上游源码最常见的泄露形态就是注释里写「例：」但值是真的。
+    只靠上下文判断会把这类行整行放过 —— 假阴性，恰恰漏掉最该报的。
     """
     v = val.lower()
     if v in PLACEHOLDER_VALUES:
         return True
     if PLACEHOLDER_PAT.search(v):
         return True
+    if always_report:
+        return False
     # 上下文里紧挨着「例：」「你的」这类提示词，且值本身像示例 → 放过
     if PLACEHOLDER_PAT.search(ctx.lower()):
         # 但如果值长得像真凭据（高熵、含大小写数字混合且够长），照样报出来
@@ -68,14 +88,17 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "cookie", "
 
 def scan_text(text: str, where: str, hits: list):
     for i, line in enumerate(text.splitlines(), 1):
-        for name, pat, level in RULES:
+        for name, pat, level, always in RULES:
             for m in pat.finditer(line):
                 val = m.group(0)
-                if len(val) < 20:
+                # 长度门槛只用来滤掉误命中的碎片。
+                # always_report 的规则不能卡这个门槛 ——
+                # 短尾 token 只有 14 字符，卡掉就等于漏报（踩过这个坑）。
+                if len(val) < 20 and not always:
                     continue
                 # 只看值本身 + 紧邻上下文判断是否占位符
                 ctx = line[max(0, m.start() - 40): m.end() + 40]
-                if _value_is_placeholder(val, ctx):
+                if _value_is_placeholder(val, ctx, always):
                     continue
                 hits.append((level, name, where, i, val[:24] + "…" if len(val) > 24 else val))
 
@@ -146,7 +169,7 @@ def scan_history(hits: list):
     for rev in revs:
         try:
             cmd = ["git", "grep", "-I", "-n", "-P"]
-            for _, pat, _lvl in RULES:
+            for _, pat, _lvl, _alw in RULES:
                 cmd += ["-e", pat.pattern]
             cmd.append(rev)
             res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -161,23 +184,29 @@ def scan_history(hits: list):
         for line in out.splitlines():
             if ":" not in line:
                 continue
-            _, rest = line.split(":", 1)
-            if ":" in rest:
-                loc, content = rest.rsplit(":", 1)
-            else:
-                loc, content = "?", rest
+            # 输出格式是 `rev:file:line:content`。
+            # 必须从左侧按固定结构切，不能 rsplit(":", 1) ——
+            # 内容里本身含冒号（token 就是 数字:字母数字），
+            # rsplit 会把最右边的冒号当分隔符，把 token 前缀切进 loc 里，
+            # content 只剩尾巴，正则自然匹配不上 → 静默漏报（踩过这个坑）。
+            #
+            # rev 是 40 位 SHA，据此定位最稳（路径含冒号也不会切错）：
+            parts = line.split(":", 3)
+            if len(parts) < 4:
+                continue
+            _rev, loc, _lineno, content = parts
             content = content.strip()
             key = (loc.strip(), content[:60])
             if key in seen:
                 continue
             seen.add(key)
-            for name, pat, level in RULES:
+            for name, pat, level, always in RULES:
                 for m in pat.finditer(content):
                     val = m.group(0)
-                    if len(val) < 20:
+                    if len(val) < 20 and not always:
                         continue
                     ctx = content[max(0, m.start() - 40): m.end() + 40]
-                    if _value_is_placeholder(val, ctx):
+                    if _value_is_placeholder(val, ctx, always):
                         continue
                     hits.append((level, name, f"[历史] {loc.strip()}", 0,
                                  val[:24] + "…"))
@@ -194,17 +223,17 @@ def scan_history(hits: list):
                                  capture_output=True, text=True, timeout=120).stdout
         except Exception:
             continue
-        for name, pat, level in RULES:
+        for name, pat, level, always in RULES:
             for m in pat.finditer(out):
                 val = m.group(0)
-                if len(val) < 20:
+                if len(val) < 20 and not always:
                     continue
                 key = (rev[:7], val[:40])
                 if key in seen:
                     continue
                 seen.add(key)
                 ctx = out[max(0, m.start() - 40): m.end() + 40]
-                if _value_is_placeholder(val, ctx):
+                if _value_is_placeholder(val, ctx, always):
                     continue
                 hits.append((level, name, f"[历史 {rev[:7]}]", 0, val[:24] + "…"))
                 break

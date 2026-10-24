@@ -43,6 +43,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # 只放「形状」，不放具体值 —— 这些正则对任何一枚同类凭据都成立。
 SHAPE_RULES = [
     ("Telegram Bot Token", r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b", "[REDACTED_TG_TOKEN]"),
+    # 半截 token（数字ID + 短尾巴），例：注释里写「例：<数字ID>:<短尾巴>」
+    # 完整 token 规则要求尾巴 30+ 位，这种短尾巴匹配不上，会残留成泄露点。
+    ("Telegram Bot Token(短尾)", r"\b\d{8,12}:[A-Za-z0-9_-]{3,}\b", "[REDACTED_TG_TOKEN]"),
     ("钉钉 access_token", r"access_token=[A-Za-z0-9]{20,}", "[REDACTED_DD_TOKEN]"),
     ("企业微信 webhook", r"qyapi\.weixin\.qq\.com/cgi-bin/webhook/send\?key=[A-Za-z0-9-]{20,}",
      "[REDACTED_WECOM_KEY]"),
@@ -87,7 +90,7 @@ def build_rules():
     """返回 [(名称, 正则串, 占位符)]，形态规则 + 字面量规则。"""
     rules = [(n, p, r) for n, p, r in SHAPE_RULES]
     for lit, _ph in load_literals():
-        # 字面量按字面匹配：转义后加边界，避免 1434 命中 [REDACTED]0
+        # 字面量按字面匹配：转义后加边界，避免短数字误命中更长的数字
         pat = r"(?<![0-9A-Za-z])" + re.escape(lit) + r"(?![0-9A-Za-z])"
         rules.append((f"字面量: {lit[:6]}…", pat, "[REDACTED]"))
     return rules

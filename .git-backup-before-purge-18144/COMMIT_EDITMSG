@@ -1,0 +1,12 @@
+fix(security): 清理工具不再自带密钥 + 修 git grep 多模式假阴性
+
+purge_secrets.sh 原先把真实 token 硬编码在 SECRETS 数组和 sed 里，
+等于「清理工具」自己就是泄露源 —— 扫历史永远扫不干净。
+
+- 新增 purge_history.py：规则驱动
+  · 形态规则（内置正则，按凭据形状识别，不含具体值）
+  · 字面量清单（.purge-secrets.local，已 gitignore，不进 git）
+- purge_secrets.sh 改为兼容入口，转调 purge_history.py
+- fix(scan): git grep 多模式必须每个带 -e，且 rev 后不能跟 --
+  （后者把 rev 当路径限定符，静默搜不到任何东西 —— 假阴性）
+- .gitignore 排除 .purge-secrets.local
