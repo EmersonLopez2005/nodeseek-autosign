@@ -29,8 +29,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # 说明：这些模式都做了「排除已知占位符」的处理，避免把 .env.example 里的空值当泄露。
 RULES = [
     ("Telegram Bot Token", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b"), "高", True),
-    # 半截 token：数字ID + 短尾巴（例：注释里写「例：[REDACTED_TG_TOKEN]...」）。
+    # 半截 token：数字ID + 短尾巴，注释里写「例：<数字ID>:<短尾巴>」那种。
     # 完整规则要求尾巴 30+ 位，这种短尾巴匹配不上 → 漏报。踩过这个坑。
+    # （刻意不写真实样例：写出来就是新的泄露点，还会被自己扫出来）
     ("Telegram Bot Token(短尾)", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{3,}\b"), "高", True),
     ("钉钉机器人 access_token", re.compile(r"access_token=[A-Za-z0-9]{20,}"), "高", True),
     ("企业微信 webhook", re.compile(r"https://qyapi\.weixin\.qq\.com/cgi-bin/webhook/send\?key=[A-Za-z0-9-]{20,}"), "高", True),
@@ -85,9 +86,21 @@ def _value_is_placeholder(val: str, ctx: str, always_report: bool = False) -> bo
 TEXT_EXT = {".py", ".md", ".sh", ".txt", ".json", ".yml", ".yaml", ".env", ".example", ".js", ".toml", ".ini", ".cfg"}
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "cookie", "data", "logs"}
 
+# 写着「正则本身」的行不算泄露 —— 扫描器/清理工具的源码里必然出现
+# 形如 数字:字母数字 的模式串，那是规则定义，不是凭据。
+# 判据：同一行里出现正则元字符（\b \d \w {n,} (…) 等）。
+_REGEX_SOURCE_HINT = re.compile(r"\\(?:b|d|w|s|D|W|S|B|A|Z)|\{\d+,\}|\(\?:|re\.compile|raw\"")
+
+
+def _is_rule_definition_line(line: str) -> bool:
+    """这行是不是在写正则规则本身（而不是写真实凭据）。"""
+    return bool(_REGEX_SOURCE_HINT.search(line))
+
 
 def scan_text(text: str, where: str, hits: list):
     for i, line in enumerate(text.splitlines(), 1):
+        if _is_rule_definition_line(line):
+            continue
         for name, pat, level, always in RULES:
             for m in pat.finditer(line):
                 val = m.group(0)

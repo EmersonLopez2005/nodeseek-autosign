@@ -63,6 +63,15 @@ _SKIP_LINE_PAT = re.compile(
     r"(?i)(your|example|placeholder|changeme|xxx|<token>|bot<token>|\*{4,})"
 )
 
+# 写着「正则本身」的行不是凭据 —— 本文件和 scan_secrets.py 的源码里
+# 必然出现形如 数字:字母数字 的模式串，那是规则定义。
+_REGEX_SOURCE_HINT = re.compile(r"\\(?:b|d|w|s|D|W|S|B|A|Z)|\{\d+,\}|\(\?:|re\.compile|raw\"")
+
+
+def _is_rule_definition_line(line: str) -> bool:
+    """这行是不是在写正则规则本身（而不是写真实凭据）。"""
+    return bool(_REGEX_SOURCE_HINT.search(line))
+
 
 def _run(args, **kw):
     return subprocess.run(
@@ -112,6 +121,8 @@ def scan_history(rules):
             if not blob:
                 continue
             for i, line in enumerate(blob.splitlines(), 1):
+                if _is_rule_definition_line(line):
+                    continue
                 for name, pat, _ph in compiled:
                     m = pat.search(line)
                     if not m:
