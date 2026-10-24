@@ -172,6 +172,17 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 | `AGENT_PROXY` | 空 | 给浏览器挂代理，如 `http://user:pass@host:port` |
 | `NS_TOTP_SECRET` | 空 | 账号开了 2FA 时填 Base32 密钥 |
 | `NS_RANDOM` | true | 签到时间随机抖动 |
+| `TG_BOT_TOKEN` / `TG_USER_ID` | 空 | Telegram 推送 |
+
+通知渠道全部通过环境变量配，不用改代码，支持：
+
+> Telegram、企业微信（机器人 / 应用）、钉钉、飞书、Bark、Server酱、PushPlus、
+> PushDeer、Gotify、iGot、Qmsg、SMTP 邮件、Synology Chat、自定义 Webhook
+
+完整变量和获取方法见 [`.env.example`](.env.example) 的「通知服务」段，配几个就推几个。
+
+> 服务器在国内或访问不了 `api.telegram.org` 时，用 `TG_API_HOST` 填反代域名，
+> 或用 `TG_PROXY_HOST` / `TG_PROXY_PORT` 走本机代理。
 
 ---
 
