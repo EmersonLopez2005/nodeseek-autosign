@@ -266,18 +266,46 @@ def _body_text(page) -> str:
         return ""
 
 
-def _turnstile_widget_ok(page) -> bool:
-    """Turnstile 组件里是否已经显示“验证成功”。"""
+def turnstile_state(page) -> str:
+    """Turnstile 组件当前状态：success / pending / error / unknown。
+
+    为什么要判状态而不是判 token：
+      NodeSeek 走的是 Turnstile 的 callback 模式，token 只存在页面 JS 变量里，
+      不会写进 input[name="cf-turnstile-response"]。
+      所以「读不到 token」是正常的，不代表验证失败。
+    """
+    found = False
     for fr in page.frames:
         if "challenges.cloudflare.com" not in (fr.url or ""):
             continue
+        found = True
+        checked = None
         try:
-            text = (fr.locator("body").inner_text() or "").strip().lower()
+            checked = fr.evaluate(
+                """() => {
+                    const cb = document.querySelector('input[type="checkbox"]');
+                    return cb ? !!cb.checked : null;
+                }"""
+            )
         except Exception:
-            continue
-        if any(k in text for k in ("成功", "success", "verified", "验证通过")):
-            return True
-    return False
+            checked = None
+        if checked:
+            return "success"
+        try:
+            text = (fr.locator("body").inner_text() or "").strip()
+        except Exception:
+            text = ""
+        low = text.lower()
+        if any(k in low for k in ("error", "failed", "无法", "失败", "重试", "retry")):
+            return "error"
+        if any(k in low for k in ("成功", "success", "verified", "验证通过")):
+            return "success"
+    return "pending" if found else "unknown"
+
+
+def _turnstile_widget_ok(page) -> bool:
+    """Turnstile 组件里是否已经显示“验证成功”。"""
+    return turnstile_state(page) == "success"
 
 
 def cookies_to_string(cookies, domain_hint="nodeseek.com") -> str:

@@ -203,6 +203,20 @@ def check_cf_backend():
     results["cf_reachable"] = reachable == len(hosts)
 
 
+def _widget_text(page, limit=90):
+    """把 Turnstile iframe 里的文字抓出来，方便判断卡在哪一步。"""
+    for fr in page.frames:
+        if "challenges.cloudflare.com" not in (fr.url or ""):
+            continue
+        try:
+            txt = (fr.locator("body").inner_text() or "").strip()
+        except Exception:
+            continue
+        txt = " ".join(txt.split())
+        return txt[:limit]
+    return ""
+
+
 # ---------------------------------------------------------------- 真实挑战
 def check_challenge(url, headless, wait=45):
     section("5. 真实打开登录页（最关键）")
@@ -252,20 +266,43 @@ def check_challenge(url, headless, wait=45):
                 say(WARN, "Turnstile 组件：当前页面没定位到")
 
             tok = None
+            state = "unknown"
+            last_state = None
             for _ in range(12):
                 tok = login_core._turnstile_token(page)
-                if tok:
+                state = login_core.turnstile_state(page)
+                if state != last_state:
+                    tag = OK if state == "success" else (
+                        BAD if state == "error" else WARN)
+                    say(tag, f"Turnstile 组件状态：{state}")
+                    wtxt = _widget_text(page)
+                    if wtxt:
+                        say(tag, f"  组件内文字：{wtxt!r}")
+                    last_state = state
+                if tok or state in ("success", "error"):
                     break
                 login_core._click_turnstile_checkbox(page)
                 page.wait_for_timeout(2500)
+
             if tok:
-                say(OK, f"Turnstile token：已获取（{len(tok)} 字符）—— 登录链路可用")
+                say(OK, f"Turnstile token：已获取（{len(tok)} 字符）")
                 results["challenge"] = "ok"
+            elif state == "success":
+                say(OK, "Turnstile 组件：已验证通过")
+                say(OK, "  读不到 token 是正常的 —— 本站走 callback 模式，")
+                say(OK, "  token 只存在页面 JS 变量里，不写进 hidden input。")
+                results["challenge"] = "widget_ok"
+            elif state == "error":
+                say(BAD, "Turnstile 组件报错（验证失败）—— 组件本身的网络/风控问题")
+                results["challenge"] = "widget_error"
+            elif state == "pending" and box:
+                say(WARN, "Turnstile 组件：一直停在待验证状态（点击没生效，或需要人工做图像题）")
+                results["challenge"] = "pending"
             elif box:
-                say(WARN, "Turnstile token：30s 内没拿到（可能用内存态，需实测 --once 登录）")
+                say(WARN, "Turnstile 组件：定位到但读不到状态")
                 results["challenge"] = "unknown"
             else:
-                say(BAD, "Turnstile token：拿不到，组件可能加载失败")
+                say(BAD, "Turnstile 组件：没加载出来")
                 results["challenge"] = "no_widget"
 
             try:
@@ -288,22 +325,41 @@ def summary():
     if not eng:
         say(BAD, "没有可用浏览器引擎，先按 README 装 patchright。")
         return
-    if ch == "ok":
-        say(OK, "这一关过了：挑战能过、Turnstile 能出 token。")
-        say(OK, "下一步实测真账号：python3 multi_site_sign_cookie_only.py")
+
+    if ch in ("ok", "widget_ok"):
+        say(OK, "这台机器可以用：整页挑战通过，Turnstile 组件正常。")
+        say(OK, "下一步实测真账号：")
+        say(OK, "  AGENT_ENGINE=patchright AGENT_HEADLESS=false \\")
+        say(OK, "  .venv/bin/python agent/nodeseek_login_agent.py --once \\")
+        say(OK, "      --user 用户名 --password '密码'")
         return
-    if ch == "unknown":
-        say(WARN, "挑战过了但没读到 token，可能是内存态。直接跑一次真登录试试。")
+
+    if ch == "pending":
+        say(WARN, "挑战过了，但 Turnstile 一直停在待验证 —— 有两种可能：")
+        say(WARN, "  1) 点击坐标没落在复选框上（看 data/envcheck.png 里的实际画面）")
+        say(WARN, "  2) 组件要求人工做图像题，自动化过不去")
+        say(WARN, "先直接测真登录，如果登录成功说明只是读状态的问题。")
         return
-    if ch in ("no_widget",) and hosting:
-        say(BAD, "IP 是机房 IP，Turnstile 组件都没加载出来。")
-        say(BAD, "这台机器跑不通，不要浪费时间调代码。")
-        say(BAD, "解决方向：换住宅/家宽/原生 IP 的机器，或给浏览器挂住宅代理"
+
+    if ch in ("unknown",):
+        say(WARN, "挑战过了但状态不明。直接跑一次真登录看结果。")
+        return
+
+    if ch in ("widget_error",):
+        say(BAD, "Turnstile 组件本身报错（不是登录逻辑的问题）。")
+        say(BAD, "多半是这个 IP 在 Cloudflare 那边评分不够，或者组件网络被拦。")
+        return
+
+    if ch == "no_widget" and hosting:
+        say(BAD, "IP 是机房 IP，Turnstile 组件都没加载出来，这台机器跑不通。")
+        say(BAD, "解决方向：换住宅/家宽/原生 IP，或给浏览器挂住宅代理"
                  "（AGENT_PROXY=http://user:pass@host:port）。")
         return
+
     if ch in ("no_widget", "error"):
         say(BAD, "浏览器能开但验证过不去。先确认出口 IP 不是机房 IP，再试 --headless 对比。")
         return
+
     say(BAD, "整页挑战过不去 —— IP 信誉不够。换 IP 比换代码有用。")
 
 
