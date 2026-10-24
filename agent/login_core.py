@@ -443,17 +443,28 @@ def _dismiss_dialog(page):
 
 
 def _install_signin_interceptor(page):
-    """在页面里同时包一层 fetch 和 XHR，捕获 /api/account/signIn 的请求与响应体。
+    """用 page.route 拦截 signIn 请求，去掉 Accept-Encoding: br，让响应体可读。
 
-    为什么要这么做：
-      登录是 NodeSeek 前端 JS 自己发的（token 在 JS 闭包里，header 也是前端加的），
-      我们用 expect_response 只能拿到网络层响应，而 Camoufox（Firefox 内核）下读 body
-      会报 NS_ERROR_INVALID_CONTENT_ENCODING，导致「登录失败：HTTP 200」这种看不出原因的错误。
+    根因（2026-10 实测）：NodeSeek 的 /api/account/signIn 响应是
+    `content-encoding: br`（Brotli 压缩），而 Camoufox（Firefox 内核）下
+    Playwright 读 body 会报 NS_ERROR_INVALID_CONTENT_ENCODING / resp.body() 直接 Error，
+    导致拿不到响应原文，只能看到「HTTP 200」。
 
-      上一版只 hook 了 window.fetch，结果没捕获到 —— 说明前端登录走的是
-      XMLHttpRequest（或 axios 等内部持有原始 fetch 引用的库）。这里把 fetch 和
-      XHR 都 hook 住，无论前端用哪种方式发请求都能抓到响应原文。
+    这里用 page.route 在请求发出前把 `Accept-Encoding` 改成 `gzip`（去掉 br），
+    服务器就会回 gzip 或明文，响应体就能正常读了。
+
+    同时保留 JS 层的 fetch/XHR hook 作为双保险（有些场景 route 不触发）。
     """
+    try:
+        page.route(
+            lambda r: SIGNIN_API_MARK in (r.url or ""),
+            lambda route: route.continue_(
+                headers={**route.request.headers, "Accept-Encoding": "gzip, deflate"}
+            ),
+        )
+    except Exception as e:
+        _log(f"page.route 拦截安装失败：{type(e).__name__}: {e}")
+
     page.evaluate(
         """() => {
             if (window.__ns_signin_hooked) return;
@@ -523,6 +534,45 @@ def _read_signin_debug(page):
         return page.evaluate("() => window.__ns_signin_debug")
     except Exception:
         return None
+
+
+def _read_login_error(page) -> Optional[str]:
+    """登录失败后，从页面 DOM 里读错误提示文字（不依赖读响应体）。
+
+    NodeSeek 登录失败时会在页面上渲染提示（密码错误 / 验证码错误 / 账号不存在…），
+    这些文字就在 DOM 里，比读 br 压缩的响应体可靠得多。
+    同时检查当前 URL 是否已跳转到 /board（登录成功的信号）。
+    """
+    url = ""
+    try:
+        url = page.url or ""
+    except Exception:
+        pass
+    if "/board" in url or "/home" in url:
+        _log(f"页面已跳转到 {url}（可能登录成功）")
+    try:
+        err = page.evaluate(
+            """() => {
+                const sels = [
+                    '.msc-alert', '.alert', '.error', '.invalid-feedback',
+                    '[class*="error"]', '[class*="alert"]', '[class*="message"]',
+                    '.text-red-500', '.text-red-600', '[role="alert"]'
+                ];
+                const out = [];
+                for (const s of sels) {
+                    for (const el of document.querySelectorAll(s)) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t && t.length < 200) out.push(t);
+                    }
+                }
+                return Array.from(new Set(out)).slice(0, 5);
+            }"""
+        )
+        if err and isinstance(err, list) and err:
+            return " | ".join(err)
+    except Exception:
+        pass
+    return None
 
 
 def _body_text(page) -> str:
@@ -794,10 +844,18 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             last_msg = str(data)[:200]
         else:
             last_msg = f"HTTP {status}"
+
+        # 读不到响应体时，从页面 DOM 里抓错误提示（最可靠的兜底）
+        if not last_msg or last_msg == f"HTTP {status}":
+            page_err = _read_login_error(page)
+            if page_err:
+                last_msg = f"页面提示：{page_err}"
+
         if not last_msg:
             last_msg = f"HTTP {status}（响应体已被浏览器丢弃，但也没拿到 sessionid）"
         _log(f"登录失败：{last_msg}")
         _log(f"  ↳ 接口原文：{data if isinstance(data, (str, dict)) else str(data)[:300]}")
+        _log(f"  ↳ 当前 URL：{page.url if hasattr(page, 'url') else '?'}")
 
         low = last_msg.lower()
         cred_hints = ("密码错误", "账号或密码", "用户名或密码", "密码不正确",
