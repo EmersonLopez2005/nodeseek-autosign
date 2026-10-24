@@ -659,6 +659,42 @@ def cookies_to_string(cookies, domain_hint="nodeseek.com") -> str:
 # --------------------------------------------------------------------------
 # 登录
 # --------------------------------------------------------------------------
+def _dump_form_structure(page):
+    """dump 登录页所有 input 元素（id/name/type/placeholder/autocomplete），
+    用于判断站点是否改版、登录标识是「用户名」还是「邮箱」、有没有多 tab 切换。"""
+    try:
+        info = page.evaluate(
+            """() => {
+                const out = [];
+                for (const el of document.querySelectorAll('input')) {
+                    const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    out.push({
+                        id: el.id || '',
+                        name: el.name || '',
+                        type: el.type || '',
+                        placeholder: (el.placeholder || '').slice(0, 30),
+                        autocomplete: el.getAttribute('autocomplete') || '',
+                        visible,
+                    });
+                }
+                // 顺便看有没有「密码登录 / 验证码登录」切换 tab 的文字
+                const tabs = [];
+                for (const el of document.querySelectorAll('a, button, [role="tab"], label, span')) {
+                    const t = (el.innerText || '').trim();
+                    if (t && (t.includes('登录') || t.includes('验证码') || t.includes('密码')) && t.length <= 12) {
+                        tabs.push(t);
+                    }
+                }
+                return { inputs: out, tabs: Array.from(new Set(tabs)).slice(0, 15) };
+            }"""
+        )
+        if info:
+            _log(f"登录页输入框：{info.get('inputs')}")
+            _log(f"登录页切换项：{info.get('tabs')}")
+    except Exception as e:
+        _log(f"表单结构 dump 失败：{type(e).__name__}")
+
+
 def login(page, username: str, password: str, totp_secret: Optional[str] = None,
           max_attempts: int = 4) -> dict:
     """
@@ -678,7 +714,9 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             "Cloudflare 整页挑战没通过。常见原因：①无头浏览器（必须用有头+Xvfb）；"
             "②出口 IP 被标记；③访问不到 challenges.cloudflare.com",
         )
+
     page.wait_for_timeout(1500)
+    _dump_form_structure(page)
 
     # 有些版本的登录页默认是“邮箱验证码”模式，需要切到密码模式
     user_input = _first_visible(page, USERNAME_SELECTORS, timeout=6000)
