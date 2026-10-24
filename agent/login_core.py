@@ -236,6 +236,14 @@ def _turnstile_token(page) -> Optional[str]:
         return None
 
 
+def _turnstile_token_detail(page) -> Optional[str]:
+    """读取 token 并带上长度/前缀，用于判断 token 是否合法（正常 Turnstile token 以 0. 或 1. 开头）。"""
+    tok = _turnstile_token(page)
+    if tok:
+        return f"{len(tok)}字符/前缀{tok[:8]!r}"
+    return None
+
+
 def _widget_box(page):
     """拿到 Turnstile 组件 iframe 的位置，用于真实鼠标点击。"""
     try:
@@ -319,6 +327,8 @@ def _wait_turnstile(page, timeout=40):
     clicked = 0
     last_click = 0.0
     last_state = None
+    last_tok = None
+    tok_stable = 0
 
     # 组件是异步渲染的，太早点会点到空白处；
     # 顺便像人一样晃一下鼠标——整个会话期间鼠标从没动过，本身就很可疑
@@ -332,16 +342,33 @@ def _wait_turnstile(page, timeout=40):
     page.wait_for_timeout(random.randint(1500, 2500))
 
     while time.time() < deadline:
-        tok = _turnstile_token(page)
-        if tok:
-            _log(f"Turnstile token 已获取（{len(tok)} 字符）")
-            return tok
-
         state = turnstile_state(page)
+        tok = _turnstile_token(page)
+
+        # 组件明确 success 是最强信号——此时 token 一定是新鲜有效的。
+        # 反过来「有 token 但组件还没 success」很可能是 hidden input 里的过期/残留 token，
+        # 拿去提交必然被判「验证码无效」。
+        if state == "success" and tok:
+            _log(f"Turnstile 验证通过（{len(tok)} 字符）")
+            return tok
         if state == "success":
-            _log(f"Turnstile 组件已通过（{time.time() - start:.0f}s）")
-            return "widget-ok"
-        if state != last_state:
+            _log(f"Turnstile 组件已通过（{time.time() - start:.0f}s），但没读到 token，继续等")
+        elif tok:
+            # 有 token 但组件状态不是 success：可能是状态误判。
+            # 若同一个 token 连续多轮稳定存在，说明验证其实已经完成、token 新鲜，
+            # 允许提交（兜底，避免因状态误判卡死）。
+            if tok == last_tok:
+                tok_stable += 1
+                if tok_stable >= 3 and time.time() - start > 6:
+                    _log(f"token 已稳定存在 {tok_stable} 轮（组件状态 {state} 可能误判），按验证通过处理")
+                    return tok
+            else:
+                tok_stable = 1
+                last_tok = tok
+            if state != last_state:
+                _log(f"已有 token（{_turnstile_token_detail(page)}）但组件状态为 {state}，等待组件确认…")
+            last_state = state
+        elif state != last_state:
             _log(f"Turnstile 组件状态：{state}")
             last_state = state
 
@@ -377,6 +404,12 @@ def _wait_turnstile(page, timeout=40):
 
         page.wait_for_timeout(800)
 
+    # 超时了。若此时 hidden input 里还有个 token，拿去做最后一次尝试
+    # （总比空手提交强）；否则返回 None 交给提交结果判断。
+    tok = _turnstile_token(page)
+    if tok:
+        _log(f"Turnstile {timeout} 秒内状态未确认，但拿到 token（{len(tok)} 字符），提交试试")
+        return tok
     _log(f"Turnstile {timeout} 秒内没拿到明确信号，直接提交看接口怎么说")
     return None
 
@@ -407,6 +440,59 @@ def _dismiss_dialog(page):
                 return
         except Exception:
             continue
+
+
+def _install_signin_interceptor(page):
+    """在页面里包一层 fetch，捕获 /api/account/signIn 的请求与响应体。
+
+    为什么要这么做：
+      登录是 NodeSeek 前端 JS 自己 fetch 的（token 在 JS 闭包里，header 也是前端加的），
+      我们用 expect_response 只能拿到网络层响应，而 Camoufox（Firefox 内核）下读 body
+      会报 NS_ERROR_INVALID_CONTENT_ENCODING，导致「登录失败：HTTP 200」这种看不出原因的错误。
+
+    这里直接在页面 JS 层 hook window.fetch，把 signIn 的请求头 + 响应原文记到
+    window.__ns_signin_debug 里，提交后读出来，就能看到接口到底回了什么
+    （token 无效 / 密码错误 / 需要 2FA / 账号不存在…）。
+    """
+    page.evaluate(
+        """() => {
+            if (window.__ns_signin_hooked) return;
+            window.__ns_signin_hooked = true;
+            window.__ns_signin_debug = null;
+            const orig = window.fetch.bind(window);
+            window.fetch = async function(input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                const isSignIn = url.indexOf('/api/account/signIn') !== -1;
+                if (isSignIn) {
+                    try {
+                        const resp = await orig(input, init);
+                        const clone = resp.clone();
+                        let bodyText = '';
+                        try { bodyText = await clone.text(); } catch (e) { bodyText = 'READ_ERR:' + e.message; }
+                        window.__ns_signin_debug = {
+                            url: url,
+                            status: resp.status,
+                            reqHeaders: init && init.headers ? (typeof init.headers === 'object' && !(init.headers instanceof Headers) ? init.headers : Object.fromEntries(new Headers(init.headers).entries())) : null,
+                            respBody: bodyText.slice(0, 2000)
+                        };
+                        return resp;
+                    } catch (e) {
+                        window.__ns_signin_debug = { url: url, fetchErr: String(e && e.message || e) };
+                        throw e;
+                    }
+                }
+                return orig(input, init);
+            };
+        }"""
+    )
+
+
+def _read_signin_debug(page):
+    """读回 signIn 的响应调试信息，供失败判定用。"""
+    try:
+        return page.evaluate("() => window.__ns_signin_debug")
+    except Exception:
+        return None
 
 
 def _body_text(page) -> str:
@@ -565,6 +651,11 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         if submit is None:
             raise LoginError("PAGE_ERROR", "找不到登录按钮")
 
+        # 提交前装好 fetch 拦截器：登录是前端 JS 自己 fetch 的，
+        # 只有这样才能在 JS 层拿到接口真实响应体（token 无效/密码错/2FA）。
+        _install_signin_interceptor(page)
+
+        resp = None
         try:
             with page.expect_response(
                 lambda r: SIGNIN_API_MARK in r.url, timeout=30000
@@ -583,21 +674,36 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         # 响应体随即被浏览器丢弃（Camoufox/Firefox 下读 body 会报
         # NS_ERROR_INVALID_CONTENT_ENCODING）。真正的判据是 cookie 里有没有 sessionid。
         page.wait_for_timeout(2500)
-        cookie = cookies_to_string(page.context.cookies())
+        all_cookies = page.context.cookies()
+        cookie = cookies_to_string(all_cookies)
+        _log(f"提交后 cookie 一览：{[c['name'] for c in all_cookies]}")
         if "sessionid=" in cookie:
             _log("登录成功（已拿到 sessionid）")
-            return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
+            return {"cookie": cookie, "cookies": all_cookies, "username": username}
 
-        # 没有 sessionid，才尝试读接口响应判断失败原因（可能页面还没跳转）
+        # 没有 sessionid：先读 fetch 拦截器捕获的接口原文，再看网络层响应兜底
+        debug = _read_signin_debug(page)
         status = None
-        try:
-            status = resp.status
-            data = resp.json()
-        except Exception:
-            data = None
+        data = None
+        if debug and isinstance(debug, dict):
+            status = debug.get("status")
+            body_text = debug.get("respBody") or ""
+            if body_text:
+                try:
+                    data = json.loads(body_text)
+                except Exception:
+                    data = body_text
+            if debug.get("fetchErr"):
+                _log(f"signIn fetch 报错：{debug['fetchErr']}")
+        if data is None and resp is not None:
+            try:
+                status = resp.status
+                data = resp.json()
+            except Exception:
+                data = None
 
         # 2FA
-        if data and data.get("need2FA"):
+        if data and isinstance(data, dict) and data.get("need2FA"):
             otp_session = data.get("otpSession", "")
             if not totp_secret:
                 raise LoginError(
@@ -627,10 +733,16 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 return {"cookie": cookie, "cookies": page.context.cookies(), "username": username}
             raise LoginError("NEED_2FA", "2FA 验证未通过，请检查 TOTP 密钥是否正确")
 
-        last_msg = (data or {}).get("message") if isinstance(data, dict) else (str(data)[:200] if data else f"HTTP {status}")
+        if isinstance(data, dict):
+            last_msg = data.get("message") or data.get("msg") or data.get("error") or json.dumps(data, ensure_ascii=False)[:200]
+        elif data:
+            last_msg = str(data)[:200]
+        else:
+            last_msg = f"HTTP {status}"
         if not last_msg:
             last_msg = f"HTTP {status}（响应体已被浏览器丢弃，但也没拿到 sessionid）"
         _log(f"登录失败：{last_msg}")
+        _log(f"  ↳ 接口原文：{data if isinstance(data, (str, dict)) else str(data)[:300]}")
 
         low = last_msg.lower()
         cred_hints = ("密码错误", "账号或密码", "用户名或密码", "密码不正确",
