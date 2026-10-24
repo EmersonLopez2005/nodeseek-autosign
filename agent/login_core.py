@@ -660,8 +660,8 @@ def cookies_to_string(cookies, domain_hint="nodeseek.com") -> str:
 # 登录
 # --------------------------------------------------------------------------
 def _dump_form_structure(page):
-    """dump 登录页所有 input 元素（id/name/type/placeholder/autocomplete），
-    用于判断站点是否改版、登录标识是「用户名」还是「邮箱」、有没有多 tab 切换。"""
+    """dump 登录页所有 input 元素 + 所有链接（a 的 href/文字），
+    用于判断站点是否改版、登录标识是「用户名」还是「邮箱」、有没有多 tab / 其他登录入口。"""
     try:
         info = page.evaluate(
             """() => {
@@ -677,20 +677,26 @@ def _dump_form_structure(page):
                         visible,
                     });
                 }
-                // 顺便看有没有「密码登录 / 验证码登录」切换 tab 的文字
-                const tabs = [];
-                for (const el of document.querySelectorAll('a, button, [role="tab"], label, span')) {
+                // 所有链接：href + 文字，重点看有没有「邮箱验证码登录 / 验证码登录 / 密码登录」等入口
+                const links = [];
+                for (const el of document.querySelectorAll('a')) {
                     const t = (el.innerText || '').trim();
-                    if (t && (t.includes('登录') || t.includes('验证码') || t.includes('密码')) && t.length <= 12) {
-                        tabs.push(t);
-                    }
+                    const h = el.getAttribute('href') || '';
+                    if (t || h) links.push({ text: t.slice(0, 30), href: h.slice(0, 80) });
                 }
-                return { inputs: out, tabs: Array.from(new Set(tabs)).slice(0, 15) };
+                // 所有按钮文字
+                const btns = [];
+                for (const el of document.querySelectorAll('button')) {
+                    const t = (el.innerText || '').trim();
+                    if (t) btns.push(t.slice(0, 30));
+                }
+                return { inputs: out, links: links.slice(0, 30), btns: Array.from(new Set(btns)).slice(0, 20) };
             }"""
         )
         if info:
             _log(f"登录页输入框：{info.get('inputs')}")
-            _log(f"登录页切换项：{info.get('tabs')}")
+            _log(f"登录页链接：{info.get('links')}")
+            _log(f"登录页按钮：{info.get('btns')}")
     except Exception as e:
         _log(f"表单结构 dump 失败：{type(e).__name__}")
 
@@ -897,6 +903,18 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
         _log(f"登录失败：{last_msg}")
         _log(f"  ↳ 接口原文：{data if isinstance(data, (str, dict)) else str(data)[:300]}")
         _log(f"  ↳ 当前 URL：{page.url if hasattr(page, 'url') else '?'}")
+
+        # 关键诊断：如果跳到了 emailSignIn.html（邮箱验证码登录页），
+        # dump 那个页面的结构，看它到底是什么、验证码框和接口在哪。
+        cur_url = ""
+        try:
+            cur_url = page.url or ""
+        except Exception:
+            pass
+        if "emailSignIn" in cur_url or "email" in cur_url.lower():
+            _log("检测到跳转到邮箱登录页，dump 该页结构：")
+            _dump_form_structure(page)
+            _debug_dump(page, "email_signin")
 
         low = last_msg.lower()
         cred_hints = ("密码错误", "账号或密码", "用户名或密码", "密码不正确",
