@@ -191,21 +191,36 @@ def _widget_box(page):
 def _click_turnstile_checkbox(page) -> bool:
     """点 Turnstile 的复选框。
 
-    实测：直接 frame.locator('input[type=checkbox]').click() 点到的是隐藏元素，
-    会触发组件的 onError（页面弹“人机验证服务加载失败”）。
-    所以优先用真实鼠标点在组件左侧复选框的像素位置上。
+    实测（2026-10，AT&T 住宅 IP）：两件事都会触发 Turnstile onError
+    （页面弹「人机验证服务加载失败」）：
+      1. frame.locator('input[type=checkbox]').click() —— 点到隐藏元素；
+      2. page.mouse.click(x, y) —— mousedown/mouseup 间隔约等于 0，
+         人类按住时长是 60~150ms，hold≈0 是经典 bot 信号。
+
+    所以这里：从随机起点多步移过去（自然轨迹）→ 悬停一瞬 →
+    按下 → 按住 60~140ms → 松开。
     """
     box = _widget_box(page)
     if box:
         try:
             x = box["x"] + 26
             y = box["y"] + box["height"] / 2
-            page.mouse.move(box["x"] + 150, y - 8)
-            page.wait_for_timeout(random.randint(200, 500))
-            page.mouse.move(x, y, steps=10)
-            page.wait_for_timeout(random.randint(120, 300))
-            page.mouse.click(x, y)
-            _log("已点击 Turnstile 复选框（坐标）")
+            # 从页面上的随机起点出发，而不是凭空出现在组件上
+            sx = max(0, box["x"] + random.uniform(-400, -120))
+            sy = max(0, y + random.uniform(-200, 200))
+            try:
+                page.mouse.move(sx, sy)
+                page.wait_for_timeout(random.randint(150, 400))
+            except Exception:
+                pass
+            page.mouse.move(x, y, steps=random.randint(15, 28))
+            # 悬停，Turnstile 会记录 hover 时长
+            page.wait_for_timeout(random.randint(150, 400))
+            # 关键：按下和松开之间要有真实的按住时长
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(60, 140))
+            page.mouse.up()
+            _log("已点击 Turnstile 复选框（按住时长已模拟）")
             return True
         except Exception as e:
             _log(f"坐标点击失败：{type(e).__name__}")
@@ -245,8 +260,16 @@ def _wait_turnstile(page, timeout=40):
     last_click = 0.0
     last_state = None
 
-    # 组件是异步渲染的，太早点会点到空白处
-    page.wait_for_timeout(2000)
+    # 组件是异步渲染的，太早点会点到空白处；
+    # 顺便像人一样晃一下鼠标——整个会话期间鼠标从没动过，本身就很可疑
+    try:
+        page.mouse.move(
+            random.uniform(300, 1100), random.uniform(200, 700),
+            steps=random.randint(10, 25),
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(1500, 2500))
 
     while time.time() < deadline:
         tok = _turnstile_token(page)
@@ -263,10 +286,13 @@ def _wait_turnstile(page, timeout=40):
             last_state = state
 
         if "人机验证服务加载失败" in _body_text(page):
+            # 这不是网络问题（网络通的时候照样弹）——是 Turnstile onError：
+            # 点击交互或浏览器指纹被判 bot。重载页面换一个新的 widget 重来，
+            # 只有连续多次都这样才彻底放弃。
             raise LoginError(
-                "TURNSTILE_NETWORK",
-                "Turnstile 组件加载失败：这台机器访问不到 challenges.cloudflare.com，"
-                "请检查出口网络/DNS（家宽直连一般没问题，机房或代理可能被墙）",
+                "TURNSTILE_INTERACT",
+                "Turnstile 拒绝了本次交互（onError）：点击特征或指纹被判定为机器人，"
+                "重载页面重试中",
             )
 
         elapsed = time.time() - start
@@ -460,7 +486,18 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
                 loc.fill(value)
             page.wait_for_timeout(random.randint(200, 500))
 
-        _wait_turnstile(page, timeout=40)
+        # 填完表先像人一样顿一下，再去看验证组件
+        page.wait_for_timeout(random.randint(600, 1500))
+        try:
+            _wait_turnstile(page, timeout=40)
+        except LoginError as e:
+            if e.code == "TURNSTILE_INTERACT" and attempt < max_attempts:
+                _dismiss_dialog(page)
+                page.wait_for_timeout(random.randint(1000, 2000))
+                _log("关闭报错弹窗，重载页面后重试")
+                user_input = _reload_login_page(page)
+                continue
+            raise
 
         submit = _first_visible(page, SUBMIT_SELECTORS, timeout=5000)
         if submit is None:

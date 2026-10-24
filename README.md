@@ -193,7 +193,7 @@ NS_COOKIE=sessionid=xxx&sessionid=yyy   # 纯 cookie，不登录
 | 卡在 "Just a moment" | IP 被 CF 判高风险 | 换 IP 或挂住宅代理，换引擎没用 |
 | 页面弹「人机验证服务加载失败」 | 无头模式 / 点错了隐藏元素 | 用有头（默认），代码已改成坐标点击 |
 | 日志里 `Turnstile 组件状态：verifying` 卡 30 秒 | 组件在转圈计算，期间被重复点击会取消重来 | 已修：现在只点 1~2 次，间隔 ≥15 秒。若仍卡住说明 IP 评分不够 |
-| `TURNSTILE_NETWORK` | 访问不到 `challenges.cloudflare.com` | 检查 DNS / 出网，机房 IP 常见 |
+| `TURNSTILE_INTERACT`（弹「人机验证服务加载失败」） | Turnstile 把点击判成 bot：点击按住时长≈0，或 WebGL 暴露 SwiftShader | 已修：按下-松开间隔 60~140ms；去掉 `--disable-gpu`；**必须 `apt install -y libgl1-mesa-dri`** |
 | `BAD_CREDENTIALS` | 密码错，或需要邮箱验证 | 先手动网页登录一次 |
 | `NEED_2FA` | 账号开了两步验证 | 配 `NS_TOTP_SECRET` |
 | `PAGE_ERROR` | 站点改版，选择器失效 | 看 `data/debug_login_page.png`，改 `agent/login_core.py` |

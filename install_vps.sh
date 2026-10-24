@@ -67,11 +67,14 @@ step "安装系统依赖（Chromium 运行库 + Xvfb + 中文字体）"
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
 
+# libgl1 / libgl1-mesa-dri：Xvfb 下的软件 OpenGL（llvmpipe）。
+# 没有它们，WebGL 会暴露 SwiftShader 渲染器 —— Cloudflare 已知 bot 特征
 PKGS="python3 python3-venv python3-pip ca-certificates curl xvfb \
 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
 libgbm1 libatspi2.0-0 libx11-xcb1 libxcb1 libxext6 libxi6 libxtst6 \
 libpango-1.0-0 libcairo2 libdbus-1-3 libexpat1 libglib2.0-0 \
+libgl1 libgl1-mesa-dri \
 fonts-noto-cjk fonts-wqy-zenhei fonts-liberation"
 
 # Debian 13(trixie) / Ubuntu 24.04 改过一些包名（libasound2 → libasound2t64 等），

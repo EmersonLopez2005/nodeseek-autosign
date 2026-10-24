@@ -252,8 +252,13 @@ def _playwright_page(name, headless, user_data_dir, proxy_cfg, locale, timezone,
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
         "--window-size=1440,900",
+        # 注意：不要加 --disable-gpu！
+        # Xvfb + --disable-gpu 会让 WebGL 走 SwiftShader，
+        # UNMASKED_RENDERER_WEBGL 直接暴露 "Google SwiftShader"，
+        # 这是 Cloudflare 已知的 bot 特征（实测触发 Turnstile onError）。
+        # 不加这个参数、装上 mesa (libgl1-mesa-dri) 后走 llvmpipe，
+        # renderer 显示为 "llvmpipe"，更像真实桌面。
         # 以下都是纯“减负”参数，不碰 canvas/webgl/字体，指纹不受影响
         "--disable-background-networking",
         "--disable-backgrounding-occluded-windows",
