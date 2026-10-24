@@ -233,9 +233,6 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 ├── install_vps.sh                 一键安装（系统依赖 / Camoufox / venv / systemd）
 ├── check_env.py                   VPS 体检：IP 类型 + 真实挑战测试
 ├── diagnose_device_memory.py      诊断：设备记忆还在不在（要不要验证码）
-├── scan_secrets.py                密钥自查（提交前扫一遍）
-├── purge_secrets.sh               清 git 历史里的密钥（兼容入口）
-├── purge_history.py               清理的实际实现（规则驱动）
 ├── multi_site_sign_cookie_only.py 主脚本：签到 + 主动续期 + 登录恢复
 ├── browser_login.py               登录适配层（远程 agent 优先，本地兜底）
 ├── notify.py                      通知（TG / 企业微信 / 钉钉 / Bark…）
@@ -385,94 +382,7 @@ ls -d /opt/nodeseek-autosign ~/.cache/camoufox ~/.cache/ms-playwright 2>/dev/nul
 
 ---
 
-## 九、密钥泄露应急处理
-
-`.env` 已被 `.gitignore` 排除，正常操作不会泄露。但如果你手滑把密码或 token 提交上去了：
-
-### 第一步：先分清「是谁的凭据」
-
-这一步决定后面怎么做，搞反了要么白费力气，要么闯祸。
-
-| 凭据归属 | 该做什么 |
-|---|---|
-| **你自己的** | 立刻去平台吊销/重置 —— 这是最优先的，删代码不等于换密钥 |
-| **别人的**（上游源码里带的、不是你生成的） | **不要**去平台撤销 —— 你没有权限，动它等于破坏别人的服务 |
-
-属于你的凭据，去哪换：
-
-| 凭据 | 去哪换 |
-|---|---|
-| Telegram Bot Token | 找 `@BotFather` → `/revoke` 吊销 → `/token` 重新生成 |
-| NodeSeek 密码 | 改密码；旧 cookie 同时作废 |
-| 钉钉/企微 webhook | 机器人后台删除重建 |
-| GitHub PAT | GitHub → Settings → Developer settings → 撤销 |
-
-**别人的凭据为什么也必须处理？** 因为它一旦进了公开仓库，就等于已经泄露给所有人 ——
-不管你承不承认，GitHub 的 secret scanning 会一直挂着告警，你自己也可能在无意间
-用它发消息。所以正确做法是：**把历史里的它抹干净，同时把事实说清楚**（向原作者
-反馈、或在告警里标注归属），而不是自己去撤销。
-
-### 第二步：自查
-
-```bash
-python3 scan_secrets.py            # 扫工作区
-python3 scan_secrets.py --staged   # 只扫已 git add 的
-python3 scan_secrets.py --history  # 连 git 历史一起扫（慢）
-```
-
-退出码 `0` = 干净，`1` = 发现疑似密钥。
-
-### 第三步：清历史（如果已经推上去了）
-
-```bash
-bash purge_secrets.sh --dry-run    # 先看会改什么
-bash purge_secrets.sh --yes        # 重写历史 + force push
-```
-
-会做四件事：备份 `.git` → 把历史里的敏感串替换成 `[REDACTED]`
-→ **删掉 `refs/original/*` 备份引用并 `gc` 回收对象**（不删的话旧对象照样能被 clone 拿到）
-→ 验证所有 ref 都搜不到后 force push。
-
-> force push 会改写所有 commit SHA。别的机器 clone 过的话要重新 clone 或 `git reset --hard origin/main`。
-
-#### 规则从哪来
-
-清理工具**本身不能携带密钥**，否则「清理工具」自己就是泄露源。
-所以规则分两类，都不含具体凭据值：
-
-- **形态规则**（内置正则）：按凭据的形状识别，比如 `\b\d{8,12}:[A-Za-z0-9_-]{30,}\b`
-  命中任意 Telegram bot token。换一枚 token 也照样抓得到。
-- **字面量清单**（`.purge-secrets.local`）：裸数字 ID、具体邮箱这类没有通用形状、
-  只能精确匹配的值放这里。该文件**已被 `.gitignore` 排除**，不进 git。
-
-```bash
-# 需要额外抹掉某个具体值时，追加一行到 .purge-secrets.local
-echo "某个具体的值" >> .purge-secrets.local
-```
-
-### 第四步：关掉告警
-
-GitHub 仓库页 →「安全和质量」→「密钥扫描」→ 把告警标成「已解决」。
-
-如果告警涉及的是**别人的**凭据，标注时说明归属（例如「上游源码中的示例值，
-非本仓库所有，已从历史移除」），避免被误判成你仍在使用该凭据。
-
-### 建议：加个 pre-commit 钩子
-
-```bash
-cat > .git/hooks/pre-commit <<'EOF'
-#!/bin/sh
-python3 scan_secrets.py --staged || {
-  echo "❌ 检测到疑似密钥，提交被阻止"
-  exit 1
-}
-EOF
-chmod +x .git/hooks/pre-commit
-```
-
----
-
-## 十、说明
+## 九、说明
 
 - 本工具只做「自动点击签到」，不刷帖、不刷积分、不做任何互动行为。
 - 请遵守 NodeSeek 的站点规则；账号因自动化被封与本项目无关。
