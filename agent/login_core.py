@@ -284,7 +284,37 @@ def _turnstile_token_detail(page) -> Optional[str]:
 
 
 def _widget_box(page):
-    """拿到 Turnstile 组件 iframe 的位置，用于真实鼠标点击。"""
+    """拿到 Turnstile 组件 iframe 的位置，用于真实鼠标点击。
+
+    **关键坑（2026-10-25 真机实测定位）**：
+    Turnstile 的 iframe 被包在 **shadow DOM** 里，
+    `page.query_selector_all('iframe[src*="challenges.cloudflare.com"]')`
+    在 light DOM 里**一个都查不到**（实测命中 0 个），
+    所以老实现永远返回 None → 「没定位到 Turnstile 组件」→
+    **复选框从来没被点过**。
+
+    正确做法：走 `page.frames` 找到 challenges.cloudflare.com 的 frame，
+    再用 `frame.frame_element()` 拿它——这是 Playwright 层面枚举的，
+    能穿 shadow root，实测拿到 bounding_box {width:300, height:65}，位置可用。
+
+    退路：万一 frame_element() 失败，再试 light DOM 查询。
+    """
+    # 1) 首选：page.frames + frame_element()（能穿 shadow DOM）
+    try:
+        for fr in page.frames:
+            if "challenges.cloudflare.com" not in (fr.url or ""):
+                continue
+            try:
+                el = fr.frame_element()
+                box = el.bounding_box()
+            except Exception:
+                continue
+            if box and box.get("width", 0) > 100:
+                return box
+    except Exception:
+        pass
+
+    # 2) 退路：light DOM 查询（有些版本 iframe 不在 shadow 里）
     try:
         for el in page.query_selector_all('iframe[src*="challenges.cloudflare.com"]'):
             box = el.bounding_box()
@@ -306,45 +336,61 @@ def _click_turnstile_checkbox(page) -> bool:
 
     所以这里：从随机起点多步移过去（自然轨迹）→ 悬停一瞬 →
     按下 → 按住 60~140ms → 松开。
+
+    **2026-10-25 新增（真实根因）**：
+    Turnstile iframe 被包在 **shadow DOM** 里，
+    `query_selector_all('iframe[src*=...])` 在 light DOM 查不到（实测命中 0 个），
+    所以老代码的 `_widget_box` 永远返回 None → **复选框从来没被点过**。
+    现在 `_widget_box` 改走 `page.frames` + `frame_element()`（能穿 shadow）。
+
+    iframe 内部是 274KB 混淆脚本，**没有**可被 Playwright 定位的
+    input/label（实测 hasCheckbox=false、hasLabel=false），
+    所以只能靠坐标点：复选框在 iframe 左侧约 30px、垂直居中。
     """
     box = _widget_box(page)
-    if box:
-        try:
-            x = box["x"] + 26
-            y = box["y"] + box["height"] / 2
-            # 从页面上的随机起点出发，而不是凭空出现在组件上
-            sx = max(0, box["x"] + random.uniform(-400, -120))
-            sy = max(0, y + random.uniform(-200, 200))
-            try:
-                page.mouse.move(sx, sy)
-                page.wait_for_timeout(random.randint(150, 400))
-            except Exception:
-                pass
-            page.mouse.move(x, y, steps=random.randint(15, 28))
-            # 悬停，Turnstile 会记录 hover 时长
-            page.wait_for_timeout(random.randint(150, 400))
-            # 关键：按下和松开之间要有真实的按住时长
-            page.mouse.down()
-            page.wait_for_timeout(random.randint(60, 140))
-            page.mouse.up()
-            _log("已点击 Turnstile 复选框（按住时长已模拟）")
-            return True
-        except Exception as e:
-            _log(f"坐标点击失败：{type(e).__name__}")
+    if not box:
+        return False
 
-    # 兜底：在 iframe 内点 label
+    def _click_at(x, y):
+        # 从页面上的随机起点出发，而不是凭空出现在组件上
+        sx = max(0, box["x"] + random.uniform(-400, -120))
+        sy = max(0, y + random.uniform(-200, 200))
+        try:
+            page.mouse.move(sx, sy)
+            page.wait_for_timeout(random.randint(150, 400))
+        except Exception:
+            pass
+        page.mouse.move(x, y, steps=random.randint(15, 28))
+        # 悬停，Turnstile 会记录 hover 时长
+        page.wait_for_timeout(random.randint(150, 400))
+        # 关键：按下和松开之间要有真实的按住时长
+        page.mouse.down()
+        page.wait_for_timeout(random.randint(60, 140))
+        page.mouse.up()
+
     try:
-        for fr in page.frames:
-            if "challenges.cloudflare.com" not in (fr.url or ""):
-                continue
-            loc = fr.locator("label").first
-            if loc.count() > 0:
-                loc.click(timeout=2500)
-                _log("已点击 Turnstile label")
-                return True
-    except Exception:
-        pass
-    return False
+        y = box["y"] + box["height"] / 2
+        # 30 是实测值：Turnstile 复选框圆心约在 iframe 左边缘 +30px
+        _click_at(box["x"] + 30, y)
+        _log("已点击 Turnstile 复选框（按住时长已模拟）")
+
+        # 微调兜底：点完若组件毫无反应（状态还是 pending 且没出 token），
+        # 说明没点准。Turnstile 复选框的实际圆心在 28~34px 之间浮动，
+        # 再补一枪横向微调的位置。
+        page.wait_for_timeout(1200)
+        try:
+            still_pending = (turnstile_state(page) == "pending"
+                             and not _acquire_ts_token(page).get("token"))
+        except Exception:
+            still_pending = False
+        if still_pending:
+            page.wait_for_timeout(random.randint(400, 900))
+            _click_at(box["x"] + 32, y)
+            _log("Turnstile 组件无响应，已横向微调补点一次")
+        return True
+    except Exception as e:
+        _log(f"坐标点击失败：{type(e).__name__}")
+        return False
 
 
 def _wait_turnstile(page, timeout=40, widget_only_ok=False):
@@ -431,20 +477,26 @@ def _wait_turnstile(page, timeout=40, widget_only_ok=False):
             )
 
         elapsed = time.time() - start
-        # 8 秒后还没过就点一次。不看 state：
+        # 8 秒后还没过就点。不看 state 是否 pending：
         #   pending   → 还没开始，需要点
         #   verifying → 可能真是转圈，也可能是状态误判；点一下最多重来一次，
         #               总比一直干等强
-        if clicked == 0 and elapsed > 8 and time.time() - last_click > 3:
-            ok = _click_turnstile_checkbox(page)
-            last_click = time.time()
-            if ok:
-                clicked = 1
-                page.wait_for_timeout(600)
-                _dbg(f"点击后状态：{turnstile_state(page)}")
-            else:
-                _dbg("没定位到 Turnstile 组件，3 秒后重试点击")
-        elif state == "error" and clicked < 2 and time.time() - last_click > 10:
+        #
+        # **2026-10-25 修正**：老逻辑 clicked==0 时只点一次，点歪了就再也不点。
+        # 但 Turnstile iframe 内部是混淆脚本、**无法用选择器定位**，
+        # 只能靠坐标点，命中不可能 100%。所以只要状态还是 pending
+        # （=没点中），就允许隔一段时间再点一次，最多 3 次。
+        if elapsed > 8 and time.time() - last_click > 6 and clicked < 3:
+            if state != "verifying":
+                ok = _click_turnstile_checkbox(page)
+                last_click = time.time()
+                if ok:
+                    clicked += 1
+                    page.wait_for_timeout(600)
+                    _dbg(f"点击后状态：{turnstile_state(page)}")
+                else:
+                    _dbg("没定位到 Turnstile 组件，6 秒后重试点击")
+        elif state == "error" and clicked < 3 and time.time() - last_click > 10:
             _dbg("Turnstile 报错，重新点一次")
             _click_turnstile_checkbox(page)
             clicked += 1
