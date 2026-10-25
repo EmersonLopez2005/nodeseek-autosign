@@ -4,16 +4,26 @@
 # 设计要点：
 #   1. 自动按「北京时间」换算本机时区对应的触发时刻
 #      —— 服务器在 UTC / 美国 / 欧洲都不会错位（这是手写 cron 最容易踩的坑）
-#   2. 幂等：重复执行不会产生重复条目
-#   3. 每次改动前自动备份原 crontab
-#   4. flock 防止上一轮没跑完就叠一轮（逻辑放在 run_sign.sh 里）
-#   5. 日志落在项目 logs/sign.log
+#   2. crontab 里**只留一行任务**，环境变量由 run_sign.sh 自己 export
+#
+#      ⚠️ 千万别把 HOME=/root PATH=... 写在调度字段的同一行！
+#         cron 的解析器（Vixie/Debian 的 load_env()）遇到 '=' 会把**整行**
+#         当成「环境变量赋值」，'=' 后面的内容（含空格）全算进变量值，
+#         不做任何分词。结果就是这一行**一个 job 都不生成**，
+#         到点永远不触发，而且**不报任何错**（crontab -l 还看得到它）。
+#         —— 这个坑本项目真踩过：定时任务装完看着一切正常，却一次都没跑过。
+#
+#         所以：环境变量要么独占一行，要么干脆别写（让 run_sign.sh 自己 export）。
+#   3. 幂等：重复执行不会产生重复条目
+#   4. 每次改动前自动备份原 crontab
+#   5. 文件锁和心跳都放在 run_sign.sh 里，锁被占用时会留下痕迹
 #
 # 用法：
-#   bash install_cron.sh                 # 默认北京时间 00:10 触发
-#   NS_SIGN_BJ_TIME=07:20 bash install_cron.sh    # 改成北京时间 07:20
-#   bash install_cron.sh --status        # 诊断：cron 装没装 / 跑没跑 / 日志在哪
-#   bash install_cron.sh --remove        # 卸载
+#   bash install_cron.sh                        # 默认北京时间 00:10 触发
+#   NS_SIGN_BJ_TIME=07:20 bash install_cron.sh  # 改成北京时间 07:20
+#   bash install_cron.sh --status               # 诊断：cron 装没装 / 跑没跑 / 日志在哪
+#   bash install_cron.sh --selftest             # 实测：cron 到底会不会执行条目（最多等 100 秒）
+#   bash install_cron.sh --remove               # 卸载
 #
 # 为什么默认 00:10：
 #   NodeSeek 每日签到状态在北京时间 0~2 点刷新，且刷新后越早签到，
@@ -34,7 +44,7 @@ TAG="# nodeseek-autosign"
 if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "remove" ]; then
   if crontab -l 2>/dev/null | grep -q "$TAG"; then
     crontab -l 2>/dev/null | grep -v "$TAG" | grep -v "multi_site_sign_cookie_only" \
-      | grep -v "run_sign.sh" | crontab - || true
+      | grep -v "run_sign.sh" | grep -v "$APP_DIR" | crontab - || true
     echo "✅ 已移除本项目的定时任务"
   else
     echo "ℹ️  crontab 里没有本项目的条目，无需卸载"
@@ -43,11 +53,77 @@ if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "remove" ]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------- 自测
+# 装一条每分钟执行的临时条目，实测 cron 到底会不会执行我们写的行。
+# 这是唯一能证明「cron 真的在跑」的可靠办法 —— 别的地方都可能骗人。
+if [ "${1:-}" = "--selftest" ] || [ "${1:-}" = "selftest" ]; then
+  TEST_FILE="/tmp/ns_cron_selftest.log"
+  rm -f "$TEST_FILE"
+  BACKUP="$(mktemp /tmp/ns_cron_backup.XXXXXX)"
+  crontab -l > "$BACKUP" 2>/dev/null || true
+
+  # 注意：cron 里 % 是换行符，命令里不能出现裸 %，所以用 date -Is
+  {
+    cat "$BACKUP"
+    echo "* * * * * echo \$(date -Is) >> $TEST_FILE"
+  } | crontab - 2>/dev/null || true
+
+  echo "=== cron 触发自测 ==="
+  echo "已临时装入一条每分钟执行的条目，最多等 100 秒 …"
+  echo "（自测期间你的 crontab 会被临时改一下，测完自动还原）"
+  echo
+  i=0
+  while [ "$i" -lt 20 ]; do
+    [ -s "$TEST_FILE" ] && break
+    sleep 5
+    i=$((i + 1))
+  done
+
+  # 还原
+  if [ -s "$BACKUP" ]; then
+    crontab "$BACKUP" 2>/dev/null || true
+  else
+    crontab -r 2>/dev/null || true
+  fi
+  rm -f "$BACKUP"
+
+  echo
+  if [ -s "$TEST_FILE" ]; then
+    echo "✅ cron 正常触发！最后一条执行记录："
+    tail -n 3 "$TEST_FILE"
+    echo
+    echo "结论：cron 守护进程和 crontab 解析都是好的。"
+    echo "      如果定时签到仍然没跑，问题就在条目内容或 run_sign.sh ——"
+    echo "      跑 bash install_cron.sh --status 看条目和日志。"
+  else
+    echo "❌ 100 秒内 cron 一次都没执行 —— cron 守护进程或 crontab 解析有问题。"
+    echo
+    echo "排查："
+    echo "  systemctl status cron            # 守护进程在不在"
+    echo "  grep -a CRON /var/log/syslog | tail -20   # cron 自己的日志"
+    echo "  crontab -l | cat -A              # 看有没有全角字符/行尾没换行"
+  fi
+  exit 0
+fi
+
 # ---------------------------------------------------------------- 诊断
 if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo "=== 1. crontab 里有没有本项目的条目 ==="
   if crontab -l 2>/dev/null | grep -q "$TAG"; then
     crontab -l 2>/dev/null | grep -A1 "$TAG"
+
+    # 反模式检测：只查**本项目自己**的行。
+    # 判断标准：这一行在冒号之前含有 '='，且 '=' 左边是个合法的变量名
+    # （cron 的 load_env() 遇到 '=' 会把整行吃掉，生成 0 个 job）。
+    # 不能对整个 crontab 扫 —— 别人的条目里写 '=' 是合法的。
+    MYLINES="$(crontab -l 2>/dev/null | grep -A1 "$TAG" | tail -n 1)"
+    if printf '%s\n' "$MYLINES" \
+      | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+[0-9*]'; then
+      echo
+      echo "  ❌ 致命问题：检测到「环境变量和调度字段写在同一行」！"
+      echo "     cron 会把整行当成环境变量赋值，等于一条 job 都没装 —— 到点永不触发。"
+      echo "     修复：bash install_cron.sh   （新版会把环境变量挪进 run_sign.sh）"
+    fi
   else
     echo "❌ 没有！定时任务压根没装（跑 bash install_cron.sh 安装）"
   fi
@@ -56,11 +132,48 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo "=== 2. cron 服务在跑吗 ==="
   if command -v systemctl >/dev/null 2>&1; then
     for u in cron crond; do
-      s=$(systemctl is-active "$u" 2>/dev/null || echo "not-found")
+      if systemctl list-unit-files "${u}.service" 2>/dev/null | grep -q "^${u}.service"; then
+        s=$(systemctl is-active "$u" 2>/dev/null || true)
+        [ -z "$s" ] && s="unknown"
+      else
+        s="not-found"
+      fi
       echo "  $u : $s"
     done
   else
     echo "  （无 systemctl，跳过）"
+  fi
+
+  echo
+  echo "=== 2.5 cron 自己的日志（看它到底执行过没有）==="
+  LOGSHOWN=0
+  if command -v journalctl >/dev/null 2>&1; then
+    OUT="$(journalctl -u cron --since "3 days ago" --no-pager 2>/dev/null | tail -n 25)"
+    if [ -n "$OUT" ]; then
+      echo "$OUT"
+      LOGSHOWN=1
+    fi
+  fi
+  if [ "$LOGSHOWN" = "0" ] && [ -f /var/log/syslog ]; then
+    grep -a "CRON" /var/log/syslog 2>/dev/null | tail -n 25
+    LOGSHOWN=1
+  fi
+  if [ "$LOGSHOWN" = "0" ]; then
+    echo "  （读不到 cron 日志：既没有 journalctl 也没有 /var/log/syslog）"
+  fi
+  echo
+  echo "  --- 我们的条目被 cron 执行过的记录（cron 成功触发时会打这一行）---"
+  HITS=""
+  if [ -f /var/log/syslog ]; then
+    HITS="$(grep -a "run_sign.sh" /var/log/syslog 2>/dev/null | tail -n 10)"
+  fi
+  if [ -z "$HITS" ] && command -v journalctl >/dev/null 2>&1; then
+    HITS="$(journalctl -u cron --since "7 days ago" --no-pager 2>/dev/null | grep -a "run_sign.sh" | tail -n 10)"
+  fi
+  if [ -n "$HITS" ]; then
+    echo "$HITS"
+  else
+    echo "  ❌ 没有任何执行记录 —— cron 从来没触发过这条任务"
   fi
 
   echo
@@ -98,6 +211,10 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo
   echo "=== 6. cookie 与通知状态 ==="
   ls -l "$APP_DIR/cookie/" 2>/dev/null || echo "  (没有 cookie/ 目录)"
+
+  echo
+  echo "=== 7. 想确认 cron 真的会执行？跑一次实测 ==="
+  echo "  bash install_cron.sh --selftest    # 临时装一条每分钟的条目，看它跑不跑"
   exit 0
 fi
 
@@ -180,9 +297,11 @@ mkdir -p "$LOG_DIR"
 # crontab 里只放一行干净调用。三个关键点：
 #   1) 调 run_sign.sh 而不是直接调 python —— cron 的命令行对 % 和引号极其敏感，
 #      而且 flock 拿不到锁时会静默跳过（crontab 里看不出来）；
-#   2) 显式写 PATH —— cron 的默认 PATH 很短，缺 /usr/local/bin 会找不到 flock；
-#   3) 写死 HOME —— profile / Xvfb / camoufox 缓存都要靠它。
-CRON_LINE="HOME=${HOME:-/root} PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $M $H * * * cd $APP_DIR && mkdir -p $LOG_DIR && bash $APP_DIR/run_sign.sh >> $LOG_DIR/cron.log 2>&1"
+#   2) **不写任何环境变量前缀** —— 环境变量和调度写同一行会让整行变成
+#      「环境变量赋值」，一条 job 都不会生成（本项目真踩过这个坑）；
+#      HOME / PATH 由 run_sign.sh 自己 export，更稳，也不会影响别的条目；
+#   3) 路径全用绝对路径 —— cron 的工作目录是 $HOME，不是项目目录。
+CRON_LINE="$M $H * * * cd $APP_DIR && mkdir -p $LOG_DIR && bash $APP_DIR/run_sign.sh >> $LOG_DIR/cron.log 2>&1"
 
 BACKUP="$APP_DIR/logs/crontab.backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$APP_DIR/logs"
@@ -191,13 +310,18 @@ echo
 echo "已备份原 crontab → $BACKUP"
 
 # 幂等：先删掉旧的同类条目，再写新的
-# 注意：老版本写的是直接调 multi_site_sign_cookie_only.py 的条目，
+# 注意：老版本写的是「环境变量 + 调度」同一行的条目，
 # 要一并清掉，否则会同时存在两条、跑两遍。
 crontab -l 2>/dev/null \
   | grep -v "$TAG" \
   | grep -v "multi_site_sign_cookie_only" \
   | grep -v "run_sign.sh" \
+  | grep -v "$APP_DIR" \
   > /tmp/ns_cron_new.$$ || true
+# 保证保留下来的内容以换行结尾 —— cron 会忽略文件里最后一行（如果它没有换行符）
+if [ -s /tmp/ns_cron_new.$$ ]; then
+  printf '\n' >> /tmp/ns_cron_new.$$
+fi
 cat /tmp/ns_cron_new.$$ > /tmp/ns_cron_final.$$
 printf '%s 每日签到（北京时间 %s 触发，本机 %02d:%02d）\n%s\n' \
   "$TAG" "$BJ_TIME" "$H" "$M" "$CRON_LINE" >> /tmp/ns_cron_final.$$
@@ -228,11 +352,17 @@ cat <<EOF
       只有 cookie 快到期要续期时才会开浏览器；那时如果 NodeSeek 要邮箱验证码，
       cron 里没法交互输入，脚本会**发 Telegram 告警**告诉你 —— 不会静默失败。
 
-2) 查状态与日志（一条命令全看完）：
+2) 实测 cron 到底会不会执行（强烈建议跑一次，1 分钟出结果）：
+
+   bash install_cron.sh --selftest
+
+   它会临时装一条每分钟的条目，看它有没有真的跑起来，测完自动还原。
+
+3) 查状态与日志（一条命令全看完）：
 
    bash install_cron.sh --status
 
-3) 卸载：
+4) 卸载：
 
    bash install_cron.sh --remove
 EOF

@@ -144,11 +144,26 @@ bash install_cron.sh
 
 ```cron
 # nodeseek-autosign 每日签到（北京时间 00:10 触发，本机 00:10）
-HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin 10 0 * * * cd /root/nodeseek-autosign && mkdir -p logs && bash /root/nodeseek-autosign/run_sign.sh >> logs/cron.log 2>&1
+10 0 * * * cd /root/nodeseek-autosign && mkdir -p /root/nodeseek-autosign/logs && bash /root/nodeseek-autosign/run_sign.sh >> /root/nodeseek-autosign/logs/cron.log 2>&1
 ```
 
-条目只调一行 `run_sign.sh`，真正的逻辑（文件锁、跑哪个 python、记心跳）都在脚本里 ——
+条目只调一行 `run_sign.sh`，真正的逻辑（文件锁、跑哪个 python、记心跳、`HOME`/`PATH`）都在脚本里 ——
 crontab 的命令行对 `%` 和引号极其敏感，逻辑写进去容易出「静默不执行」的怪问题。
+
+> ⚠️ **一个真实踩过的坑**：crontab 里**绝对不能**把环境变量和调度字段写在同一行
+> （例如 `HOME=/root 10 0 * * * cmd`）。
+> cron 的解析器遇到 `=` 会把**整行**当成「环境变量赋值」，`=` 后面的内容（**含空格**）
+> 全算进变量值，不做任何分词 —— 结果这一行**一个 job 都不生成**，
+> 到点永远不触发，而且**不报任何错**（`crontab -l` 还看得到它）。
+> 所以本项目的做法是：crontab 里一行环境变量都不写，`HOME`/`PATH` 由 `run_sign.sh` 自己 export。
+
+**确认 cron 真的会执行**（1 分钟出结果，强烈建议装完跑一次）：
+
+```bash
+bash install_cron.sh --selftest
+```
+
+它会临时装一条每分钟执行的条目，看它有没有真的跑起来，测完自动还原你的 crontab。
 
 **日志在哪、怎么查**：
 
