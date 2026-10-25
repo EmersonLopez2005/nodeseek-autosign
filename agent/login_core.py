@@ -359,22 +359,28 @@ def _wait_turnstile(page, timeout=40, widget_only_ok=False):
     所以策略是：先给 8 秒自动通过的机会 → 没动静就点一次 → 之后只等不点
     （只有明确 error 才允许再点一次）。
 
+    **什么才算「通过了」（2026-10 真机实测后改）**：
+      唯一权威信号是**真的拿到 token**（组件 expose 的 getResponse()，
+      或者 hidden input 里的 cf-turnstile-response）。
+      组件显示「验证成功」**不算数**——那是读 iframe 里的文字，
+      而页面上**别的** Cloudflare frame（整页挑战页残留、其它组件）
+      同样会带「成功/success」字样。曾因此把「根本没通过」误判成通过，
+      拿着空 token 去发码，被站点以「请先通过人机验证」挡回来，
+      而日志里只留下一句「20 秒内没看到任何接口响应」。
+      所以：**state 只用来决定「要不要点」，token 才是通行证**。
+
     返回 token / "widget-ok"；拿不到明确信号返回 None（交给提交结果判断）。
 
     widget_only_ok=True 时（邮箱验证页用）：
-      NodeSeek 走 Turnstile 的 **callback 模式**，token 只存在页面 JS 变量里，
-      **不会写进 input[name="cf-turnstile-response"]**。
-      所以「读不到 token」不代表没通过——唯一的可靠依据是组件状态 success。
-      这种模式下只要组件显示通过就立刻返回，别再空等满超时
-      （之前就是白等 30 秒，然后还打印一句误导性的「Turnstile 已就绪」）。
+      组件明确显示通过、且持续 10 秒以上、但就是取不到 token（极少见），
+      按「已验证但无 token」处理返回 "widget-ok"，让调用方走
+      「点按钮 + 读站点真实提示」的兜底，而不是干等满超时。
     """
     start = time.time()
     deadline = start + timeout
     clicked = 0
     last_click = 0.0
     last_state = None
-    last_tok = None
-    tok_stable = 0
     success_at = None
 
     # 组件是异步渲染的，太早点会点到空白处；
@@ -390,44 +396,29 @@ def _wait_turnstile(page, timeout=40, widget_only_ok=False):
 
     while time.time() < deadline:
         state = turnstile_state(page)
-        tok = _turnstile_token(page)
 
-        # 组件明确 success 是最强信号——此时 token 一定是新鲜有效的。
-        # 反过来「有 token 但组件还没 success」很可能是 hidden input 里的过期/残留 token，
-        # 拿去提交必然被判「验证码无效」。
-        if state == "success" and tok:
-            _log(f"Turnstile 验证通过（{len(tok)} 字符）")
-            return tok
-        if state == "success":
-            if widget_only_ok:
-                # callback 模式：token 不落 hidden input，组件 success 就是通过
-                _log("Turnstile 组件已显示验证通过（callback 模式，token 不落 hidden input）")
-                return "widget-ok"
-            _dbg(f"Turnstile 组件已通过（{time.time() - start:.0f}s），但没读到 token，继续等")
-            if success_at is None:
-                success_at = time.time()
-            elif time.time() - success_at > 12:
-                # 连着 12 秒都是 success 状态却读不到 token —— 判定就是 callback 模式
-                _log("Turnstile 组件持续显示通过（callback 模式），按已验证处理")
-                return "widget-ok"
-        elif tok:
-            # 有 token 但组件状态不是 success：可能是状态误判。
-            # 若同一个 token 连续多轮稳定存在，说明验证其实已经完成、token 新鲜，
-            # 允许提交（兜底，避免因状态误判卡死）。
-            if tok == last_tok:
-                tok_stable += 1
-                if tok_stable >= 3 and time.time() - start > 6:
-                    _dbg(f"token 已稳定存在 {tok_stable} 轮（组件状态 {state} 可能误判），按验证通过处理")
-                    return tok
-            else:
-                tok_stable = 1
-                last_tok = tok
-            if state != last_state:
-                _dbg(f"已有 token 但组件状态为 {state}，等待组件确认…")
-            last_state = state
-        elif state != last_state:
+        # 权威信号：真的拿到 token（getResponse 优先，hidden input 兜底）
+        tok = _acquire_ts_token(page)
+        if tok.get("token"):
+            _log(f"Turnstile 验证通过（{len(tok['token'])} 字符，"
+                 f"来源：{tok.get('via')}）")
+            return tok["token"]
+
+        if state != last_state:
             _dbg(f"Turnstile 组件状态：{state}")
             last_state = state
+        if state == "success":
+            # 组件说通过了但拿不到 token —— 不可信（多半是别的 frame 带的字样），
+            # 继续等；持续 10 秒还没有才按 callback 模式处理。
+            if success_at is None:
+                success_at = time.time()
+            elif time.time() - success_at > 10:
+                if widget_only_ok:
+                    _log("Turnstile 组件显示通过但取不到 token，按「已验证无 token」处理")
+                    return "widget-ok"
+                _dbg("组件显示通过但取不到 token，继续等")
+        else:
+            success_at = None
 
         if "人机验证服务加载失败" in _body_text(page):
             # 这不是网络问题（网络通的时候照样弹）——是 Turnstile onError：
@@ -461,12 +452,16 @@ def _wait_turnstile(page, timeout=40, widget_only_ok=False):
 
         page.wait_for_timeout(800)
 
-    # 超时了。若此时 hidden input 里还有个 token，拿去做最后一次尝试
-    # （总比空手提交强）；否则返回 None 交给提交结果判断。
-    tok = _turnstile_token(page)
-    if tok:
-        _log(f"Turnstile {timeout} 秒内状态未确认，但拿到 token（{len(tok)} 字符），提交试试")
-        return tok
+    # 超时了。最后再取一次 token（可能刚好在这时验证完）
+    tok = _acquire_ts_token(page)
+    if tok.get("token"):
+        _log(f"Turnstile {timeout} 秒内状态未确认，但拿到 token"
+             f"（{len(tok['token'])} 字符），提交试试")
+        return tok["token"]
+    if success_at is not None:
+        _log("Turnstile 组件显示通过却取不到 token（多半是状态被别的 frame 误导），"
+             "按未通过处理")
+        return None
     _log(f"Turnstile {timeout} 秒内没拿到明确信号，直接提交看接口怎么说")
     return None
 
@@ -491,7 +486,28 @@ def _dismiss_dialog(page):
 
     实测（2026-10）：emailSignIn 页面发码后会弹一个带 '×' / 'OK' 按钮的模态框，
     它盖在验证码输入框上，locator.click() 直接 TimeoutError。
+
+    站点用的是 msc.js：容器 class 是 **.msc-confirm**（不是 .msc-alert），
+    结构是 .msc-confirm > .msc-overlay > button.msc-close（×）
+    ＋ .msc-content > h3.msc-title / .msc-body / button.msc-ok（OK）。
+    站点还导出了全局 mscClose()，直接调它最干净。
     """
+    # 0) 最干净的做法：直接调站点自己的 mscClose()
+    try:
+        closed = page.evaluate(
+            """() => {
+                if (!document.querySelector('.msc-confirm')) return false;
+                if (typeof window.mscClose === 'function') { window.mscClose(); return true; }
+                return false;
+            }"""
+        )
+        if closed:
+            page.wait_for_timeout(300)
+            _log("已关闭弹窗")
+            return True
+    except Exception:
+        pass
+
     # 1) 先找带文字的确认按钮
     for txt in ["OK", "确定", "知道了", "关闭", "好"]:
         try:
@@ -506,6 +522,8 @@ def _dismiss_dialog(page):
 
     # 2) 再找常见的关闭元素（mscAlert 的 × / .close / [aria-label=close]）
     for sel in [
+        ".msc-confirm .msc-ok",
+        ".msc-confirm .msc-close",
         ".msc-alert .close",
         ".modal .close",
         "button[aria-label='Close']",
@@ -632,7 +650,7 @@ def _signin_via_page_fetch(page, username: str, password: str):
             return '';
         };
 
-        const captchaToken = getToken();
+        const captchaToken = getToken() || (payload.token || '');
         if (!captchaToken) {
             out.error = 'NO_CAPTCHA_TOKEN';
             return out;
@@ -678,7 +696,11 @@ def _signin_via_page_fetch(page, username: str, password: str):
     }
     """
     try:
-        return page.evaluate(js, {"username": username, "password": password})
+        # 登录页的 token 正常会写进 hidden input；但万一这页也是 explicit render
+        # （token 只在组件里），就用 _acquire_ts_token 兜底取一个填进来。
+        fallback_tok = _acquire_ts_token(page).get("token") or ""
+        return page.evaluate(js, {"username": username, "password": password,
+                                  "token": fallback_tok})
     except Exception as e:
         _log(f"主动 fetch 登录异常：{type(e).__name__}: {e}")
         return None
@@ -955,16 +977,28 @@ def _looks_like_error(text: str) -> bool:
 
 
 def _looks_like_sent(text: str) -> bool:
-    """一段文字看起来像「已发送」的成功提示吗？"""
+    """一段文字看起来像「已发送」的成功提示吗？
+
+    注意站点的原文是「验证码**已经**发送，如未收到请检查垃圾邮件」——
+    「已发送」是「已经发送」的子串吗？不是！中间隔了个「经」。
+    旧实现只匹配「已发送」，所以站点真成功时反而判不出来，这里补上「已经发送」。
+    """
     t = (text or "").lower()
-    keys = ("已发送", "发送成功", "已发", "sent successfully", "send success")
+    keys = ("已经发送", "已发送", "发送成功", "已发", "sent successfully", "send success")
     return any(k in t for k in keys)
 
 
 def _is_send_api(url: str) -> bool:
-    """这个接口看起来像「发验证码」吗？（用来从一堆 API 响应里挑出对的那个）"""
+    """这个接口看起来像「发验证码」吗？（用来从一堆 API 响应里挑出对的那个）
+
+    站点真实的发码接口是 POST /api/email（2026-10 逆向自前端 bundle），
+    先精确匹配它，再退回粗筛。注意别把 /api/account/emailSignIn（提交验证码）
+    也当成发码——那俩是不同的事。
+    """
     u = (url or "").lower()
-    return any(k in u for k in ("send", "code", "email", "verify", "captcha"))
+    if "/api/email" in u:
+        return True
+    return any(k in u for k in ("send", "code", "verify", "captcha"))
 
 
 def _api_log_window(page) -> list:
@@ -1003,11 +1037,16 @@ def _is_countdown(text: str) -> bool:
 
 
 def _page_notice_text(page) -> str:
-    """页面上冒出来的提示文字（发码成功/失败的消息通常在这里）。"""
+    """页面上冒出来的提示文字（发码成功/失败的消息通常在这里）。
+
+    注意：站点用的是 msc.js，弹窗容器 class 是 **.msc-confirm**，
+    旧代码只抓 .msc-alert / .modal.show，站点真实提示一条都读不到。
+    """
     try:
         return (page.evaluate(
             """() => {
-                for (const sel of ['.msc-alert', '.modal.show', '[role="dialog"]',
+                for (const sel of ['.msc-confirm', '.msc-alert', '.modal.show',
+                                   '[role="dialog"]',
                                    '.swal2-container', '.invalid-feedback',
                                    '[class*="toast"]', '[class*="Toast"]']) {
                     for (const el of document.querySelectorAll(sel)) {
@@ -1109,27 +1148,425 @@ def _fill_email_field(page, email_hint: str) -> tuple:
     return True, filled
 
 
-def _send_email_code(page, email_hint: str, attempts: int = 3) -> tuple:
-    """点「发送验证码」，并确认邮件真的发出去了。
+# ---------------------------------------------------------------------------
+# Turnstile token 与「发验证码」——完全按站点真实协议实现
+#
+# 下面是 2026-10 从站点前端 bundle（assets/index-Bz3_0Bch.js，emailSignIn 页）
+# 逆向出来的发码逻辑原文，一字未改：
+#
+#   async function x(){
+#     if(!w(c.email)){ m.value=!1; return }                       # 邮箱格式非法 → 静默 return
+#     if(n.value!=="loading"){
+#       if(!r.value){ mscAlert("请先通过人机验证"); return }          # 没 token → 弹提示，**一个请求都不发**
+#       n.value="loading";
+#       try{
+#         const t=await fetch("/api/email",{method:"POST",
+#           headers:{"content-type":"application/json"},
+#           body:JSON.stringify({email:c.email,mode:c.mode,token:r.value,
+#                                source:"turnstile",version:"v3"})}).then(e=>e.json());
+#         if(t.success){ V(); mscAlert("验证码已经发送，如未收到请检查垃圾邮件"); return }
+#         n.value="not-started"; mscAlert(t.message||"操作失败"); p.value.reset()
+#       }catch{ n.value="not-started"; mscAlert("网络错误"); p.value.reset() }
+#     }
+#   }
+#
+# 由此确认了三个此前踩空的事实：
+#   1) 发码接口是 POST /api/email，token 放在 **body** 里（不是 header）；
+#      emailSignIn 页的 mode 固定 "totp"，另有 source="turnstile"、version="v3"；
+#      该接口不需要 x-security-token / x-integrity-token（站点自己就没带）；
+#   2) Turnstile 是 explicit render，token 只经 callback 存进 Vue 状态，
+#      **不写 hidden input**，只能靠 Turnstile 封装组件 expose 出来的
+#      getResponse() 取（它 expose 了 {reset, removeWidget, getResponse}）；
+#   3) 没有 token 时站点直接 return，**不会发任何请求**——旧实现把这种情况
+#      笼统报成「20 秒内没看到任何接口响应」，真实原因被吞掉了；
+#      而 mscAlert 的弹窗 class 是 .msc-confirm（提示文字在 h3.msc-title），
+#      旧代码抓的是 .msc-alert / .modal.show，同样抓不到。
+# ---------------------------------------------------------------------------
+
+# 取 token：遍历 Vue 组件树，找 Turnstile 封装组件 expose 出来的 getResponse()。
+#
+# ⚠️ 关键（2026-10 真机实测）：**不能**靠遍历 DOM 找 __vueParentComponent——
+# Vue 生产构建默认不挂这个属性（__VUE_PROD_DEVTOOLS__ = false），实测页面上
+# 带 __vueParentComponent 的元素数量是 0。
+# 正确的入口是挂载容器的 _vnode.component：
+#   1) 找到带 __vue_app__ 的宿主元素
+#   2) host._vnode.component = 根组件实例（app._instance 不一定有）
+#   3) 沿 inst.subTree 递归子组件
+# 真机实测到的组件树：
+#   index（emailSignIn 页）  refs: emailAuthRef -> 验证码组件
+#   index（验证码组件）       refs: turnstileRef -> Turnstile 封装组件
+#   index（Turnstile 封装）   exposed: ['reset','removeWidget','getResponse']
+_TS_TOKEN_JS = r"""
+() => {
+    const res = {token: '', via: ''};
+
+    const pick = (c) => {
+        try {
+            if (c && typeof c.getResponse === 'function') {
+                const t = c.getResponse();
+                if (typeof t === 'string' && t.length > 20) return t;
+            }
+        } catch (e) {}
+        return '';
+    };
+
+    function findRoot() {
+        for (const el of document.querySelectorAll('*')) {
+            const app = el.__vue_app__;
+            if (!app) continue;
+            if (el._vnode && el._vnode.component) return el._vnode.component;
+            if (app._instance) return app._instance;
+            if (app._container && app._container._vnode && app._container._vnode.component) {
+                return app._container._vnode.component;
+            }
+        }
+        return null;
+    }
+
+    const seen = new Set();
+    function visitInst(inst) {
+        if (!inst || seen.has(inst)) return '';
+        seen.add(inst);
+        // 1) 自身 expose 的 getResponse（Turnstile 封装组件）
+        let t = pick(inst.exposed);
+        if (t) return t;
+        // 2) 模板 ref 指向的子组件
+        try {
+            const refs = inst.refs || {};
+            for (const k of Object.keys(refs)) {
+                t = pick(refs[k]);
+                if (t) return t;
+            }
+        } catch (e) {}
+        // 3) 子组件
+        try { return visitVNode(inst.subTree); } catch (e) { return ''; }
+    }
+    function visitVNode(v) {
+        if (!v || typeof v !== 'object') return '';
+        let t = '';
+        if (v.component) { t = visitInst(v.component); if (t) return t; }
+        if (Array.isArray(v.children)) {
+            for (const c of v.children) { t = visitVNode(c); if (t) return t; }
+        }
+        if (v.suspense) {
+            try { t = visitVNode(v.suspense.activeBranch); } catch (e) {}
+            if (!t) { try { t = visitVNode(v.suspense.pendingBranch); } catch (e) {} }
+        }
+        return t;
+    }
+
+    const root = findRoot();
+    if (root) {
+        const token = visitInst(root);
+        if (token) { res.token = token; res.via = 'vue-tree-getResponse'; return res; }
+    }
+
+    // 4) Turnstile 全局 API（不带 widget id 时取第一个组件）
+    try {
+        if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+            const t = window.turnstile.getResponse();
+            if (typeof t === 'string' && t.length > 20) {
+                res.token = t; res.via = 'turnstile-global'; return res;
+            }
+        }
+    } catch (e) {}
+    // 5) hidden input 兜底（Cloudflare 组件容器里确实会写这个 input）
+    try {
+        for (const el of document.querySelectorAll(
+                'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]')) {
+            if (el.value && el.value.length > 20) {
+                res.token = el.value; res.via = 'hidden-input'; return res;
+            }
+        }
+    } catch (e) {}
+    return res;
+}
+"""
+
+# 重置 Turnstile：站点在发码失败时也是这么干的（p.value.reset()），
+# 目的是让组件出一个**新** token（旧的已被用过，是一次性的）。
+_TS_RESET_JS = r"""
+() => {
+    const call = (c) => {
+        try {
+            if (c && typeof c.reset === 'function') { c.reset(); return true; }
+        } catch (e) {}
+        return false;
+    };
+    function findRoot() {
+        for (const el of document.querySelectorAll('*')) {
+            const app = el.__vue_app__;
+            if (!app) continue;
+            if (el._vnode && el._vnode.component) return el._vnode.component;
+            if (app._instance) return app._instance;
+            if (app._container && app._container._vnode && app._container._vnode.component) {
+                return app._container._vnode.component;
+            }
+        }
+        return null;
+    }
+    const seen = new Set();
+    function visitInst(inst) {
+        if (!inst || seen.has(inst)) return false;
+        seen.add(inst);
+        if (call(inst.exposed)) return true;
+        try {
+            const refs = inst.refs || {};
+            for (const k of Object.keys(refs)) {
+                if (call(refs[k])) return true;
+            }
+        } catch (e) {}
+        try { return visitVNode(inst.subTree); } catch (e) { return false; }
+    }
+    function visitVNode(v) {
+        if (!v || typeof v !== 'object') return false;
+        if (v.component && visitInst(v.component)) return true;
+        if (Array.isArray(v.children)) {
+            for (const c of v.children) { if (visitVNode(c)) return true; }
+        }
+        if (v.suspense) {
+            try { if (visitVNode(v.suspense.activeBranch)) return true; } catch (e) {}
+            try { if (visitVNode(v.suspense.pendingBranch)) return true; } catch (e) {}
+        }
+        return false;
+    }
+    const root = findRoot();
+    if (root) return visitInst(root);
+    return false;
+}
+"""
+
+# 按站点原样发码。放在页面上下文里发，cookie / 同源 / UA / 出口 IP 全部一致。
+_SEND_EMAIL_JS = r"""
+async (args) => {
+    const {email, mode, token} = args;
+    try {
+        const resp = await fetch('/api/email', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+                email: email, mode: mode, token: token,
+                source: 'turnstile', version: 'v3'
+            })
+        });
+        let body = '';
+        try { body = await resp.text(); } catch (e) { body = 'READ_ERR'; }
+        let parsed = null;
+        try { parsed = JSON.parse(body); } catch (e) {}
+        const msg = (parsed && (parsed.message || parsed.msg || parsed.error || parsed.errMsg)) || '';
+        return {
+            status: resp.status,
+            body: String(body).slice(0, 800),
+            success: !!(parsed && parsed.success),
+            message: String(msg)
+        };
+    } catch (e) {
+        return {
+            status: 0,
+            body: 'EXC:' + (e && e.message ? e.message : e),
+            success: false,
+            message: '网络错误'
+        };
+    }
+}
+"""
+
+
+def _acquire_ts_token(page) -> dict:
+    """拿 Turnstile token。返回 {"token": str, "via": str}。"""
+    try:
+        res = page.evaluate(_TS_TOKEN_JS)
+        return res if isinstance(res, dict) else {}
+    except Exception as e:
+        _dbg(f"读 Turnstile token 异常：{type(e).__name__}")
+        return {}
+
+
+def _reset_ts_widget(page) -> bool:
+    """让 Turnstile 组件重出一个新 token（旧的已被用过，是一次性的）。"""
+    try:
+        ok = page.evaluate(_TS_RESET_JS)
+        if ok:
+            _log("已重置 Turnstile 组件，等它出新的 token")
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _post_send_email(page, email: str, mode: str, token: str) -> dict:
+    """按站点真实协议调 POST /api/email 发码。"""
+    try:
+        res = page.evaluate(_SEND_EMAIL_JS,
+                             {"email": email, "mode": mode, "token": token})
+        return res if isinstance(res, dict) else {}
+    except Exception as e:
+        _dbg(f"发码请求异常：{type(e).__name__}")
+        return {"status": 0, "body": f"EXC:{e}", "success": False, "message": ""}
+
+
+def _judge_api_email(res: dict) -> tuple:
+    """把 /api/email 的响应判成 (是否成功, 详情)。"""
+    if not res:
+        return False, "发码请求没有返回结果"
+    status = res.get("status") or 0
+    body = str(res.get("body") or "").strip()
+    msg = str(res.get("message") or "").strip()
+    if res.get("success"):
+        return True, f"接口返回成功（HTTP {status}）" + (f"：{msg}" if msg else "")
+    if status == 0:
+        return False, f"发码请求没发出去：{body[:200] or '网络错误'}"
+    if msg:
+        return False, f"接口返回失败（HTTP {status}）：{msg}"
+    return False, f"接口返回失败（HTTP {status}）：{body[:200]}"
+
+
+def _looks_like_token_problem(text: str) -> bool:
+    """失败原因是不是「token 不对/过期/用过了」这类——这类才值得重来一次。"""
+    t = (text or "").lower()
+    keys = ("token", "captcha", "人机", "turnstile", "expired", "invalid",
+            "无效", "过期", "重复", "duplicate")
+    return any(k in t for k in keys)
+
+
+def _ns_alert_text(page) -> str:
+    """读站点 mscAlert 弹窗里的提示文字。
+
+    站点用的是 msc.js：容器 class 是 **.msc-confirm**（不是 .msc-alert），
+    结构是 .msc-confirm > .msc-content > h3.msc-title（提示文字）
+    ＋ .msc-body（正文），确认按钮是 button.msc-ok（文字 "OK"）。
+    旧实现抓 .msc-alert / .modal.show，所以站点弹的「请先通过人机验证」、
+    「Cloudflare人机验证服务加载失败」这些真实原因一条都读不到。
+    """
+    try:
+        return (page.evaluate(
+            """() => {
+                for (const el of document.querySelectorAll('.msc-confirm')) {
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    const title = el.querySelector('h3.msc-title');
+                    const body = el.querySelector('.msc-body');
+                    let s = '';
+                    if (title) s += (title.innerText || '').trim();
+                    if (body) {
+                        const bt = (body.innerText || '').trim();
+                        if (bt && bt !== s) s += (s ? ' / ' : '') + bt;
+                    }
+                    if (!s) s = (el.innerText || '').trim();
+                    if (s) return s.slice(0, 300);
+                }
+                return '';
+            }"""
+        ) or "").strip()
+    except Exception:
+        return ""
+
+
+def _better_detail(new: str, old: str) -> str:
+    """挑更有信息量的失败原因（别用含糊的覆盖具体的）。"""
+    if not new:
+        return old
+    if not old:
+        return new
+    for g in ("没看到任何接口响应", "点了按钮，但"):
+        if g in new:
+            return old
+    return new
+
+
+def _click_send_and_watch(page, before: int = 0, wait: int = 20) -> tuple:
+    """点站点自己的「发送验证码」按钮，并观察站点给出的结果。
+
+    这是拿不到 token 时的兜底路径。返回 (ok, detail)；
+    完全观察不出结果时 detail 是空串（表示「什么线索都没有」）。
+    """
+    # 上一次残留的弹窗会盖住按钮，先清掉
+    try:
+        _dismiss_dialog(page)
+    except Exception:
+        pass
+
+    send_btn = None
+    for sel in ["button:has-text('发送验证码')", "button:has-text('发送')",
+                "button:has-text('获取')"]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                send_btn = loc
+                break
+        except Exception:
+            continue
+    if send_btn is None:
+        return False, "页面上没找到「发送验证码」按钮"
+
+    # 坐标点击（locator.click() 在 Camoufox 下可能点到被遮挡/隐藏元素，
+    # 表现为「已点击」但实际没触发发信）
+    try:
+        box = send_btn.bounding_box()
+        if box:
+            x = box["x"] + box["width"] / 2
+            y = box["y"] + box["height"] / 2
+            page.mouse.move(x, y, steps=random.randint(5, 12))
+            page.wait_for_timeout(random.randint(100, 300))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(60, 140))
+            page.mouse.up()
+            _log("已点击「发送验证码」（坐标点击）")
+        else:
+            send_btn.click(timeout=5000)
+            _log("已点击「发送验证码」（locator 点击）")
+    except Exception as e:
+        return False, f"点击发送验证码失败：{type(e).__name__}"
+
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        page.wait_for_timeout(600)
+        # 1) 站点弹窗里的真实提示（成功/失败原因都在这儿）
+        alert = _ns_alert_text(page)
+        if alert:
+            if _looks_like_sent(alert):
+                return True, f"页面提示：{alert}"
+            return False, f"页面提示：{alert}"
+        # 2) 接口响应
+        new = _api_log_window(page)[before:]
+        if new:
+            send_entries = [e for e in new if _is_send_api(e.get("url") or "")]
+            if send_entries:
+                verdict = _judge_send_response(send_entries, strict=True)
+                if verdict is not None:
+                    return verdict
+            for e in new[-3:]:
+                _dbg(f"发码接口响应：{e.get('url')} status={e.get('status')} "
+                     f"body={str(e.get('body'))[:200]}")
+        # 3) 按钮进入倒计时
+        btn_text = _send_btn_text(page)
+        if _is_countdown(btn_text):
+            return True, f"按钮已进入倒计时（{btn_text}）"
+    return False, "点了按钮，但站点既没发请求也没弹提示"
+
+
+def _send_email_code(page, email_hint: str, attempts: int = 3,
+                     mode: str = "totp") -> tuple:
+    """把验证码邮件真正发出去。
 
     返回 (是否发出, 详情说明, 实际使用的邮箱地址)。
 
-    为什么不能「点了就当成功」：发码请求可能被服务器拒（Turnstile 没通过、
-    频率限制、邮箱为空…），这时候邮箱里永远不会出现邮件。
-    旧版点完就直接让用户去查收码，用户只能干等——这就是「又没收到验证码」
-    的真正原因：请求压根没发出去，日志却什么都没说。
+    主路径（2026-10 按站点真实协议重写）：拿到 Turnstile token 后，直接照站点
+    的样子调 POST /api/email，读接口的真实 JSON 判定成败——不再依赖
+    「坐标点击 + 猜按钮文字」这种一戳就碎的链路。
 
-    判据（按可靠性排序）：
-      1) 接口响应体 success=true / code=0
-      2) 按钮文字变成倒计时（「60s 后重发」）
-      3) 页面弹出「已发送」
-      4) 接口响应体里带明确失败信息 → 立刻判失败，并把原文报出来
+    兜底：拿不到 token（或 token 类失败）时，先用站点自己的组件重置 Turnstile
+    拿新 token；再不行才去点站点按钮，并读站点弹窗的真实提示。
+
+    为什么不能「点了就当成功」：发码请求可能被服务器拒（Turnstile 没通过、
+    频率限制、邮箱为空…），这时候邮箱里永远不会出现邮件。旧版点完就直接让
+    用户去查收码，用户只能干等——这就是「又没收到验证码」的真正原因：
+    请求压根没发出去，日志却什么都没说。
     """
     detail = ""
-    prev_detail = ""
+    best_detail = ""
     used_email = email_hint
     for attempt in range(1, attempts + 1):
-        # 记录器要在点击之前就装好，否则抓不到这次请求的响应
+        # 记录器要在发请求之前就装好，否则抓不到这次请求的响应
         _install_api_logger(page)
         # 邮箱必须先填好——发码请求要带收件地址
         filled_ok, actual_email = _fill_email_field(page, email_hint)
@@ -1139,93 +1576,54 @@ def _send_email_code(page, email_hint: str, attempts: int = 3) -> tuple:
             # 页面自己填的地址更可信（redirect 里可能没带 email 参数）
             email_hint = actual_email
         used_email = actual_email or email_hint
+        if not used_email:
+            return False, "拿不到收件邮箱，发码请求发不出去", ""
 
-        before = len(_api_log_window(page))
-
-        send_btn = None
-        for sel in ["button:has-text('发送验证码')", "button:has-text('发送')",
-                    "button:has-text('获取')"]:
-            try:
-                loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    send_btn = loc
-                    break
-            except Exception:
-                continue
-        if send_btn is None:
-            detail = "页面上没找到「发送验证码」按钮"
-            _log(f"✗ {detail}")
-            return False, detail, used_email
-
-        # 坐标点击（locator.click() 在 Camoufox 下可能点到被遮挡/隐藏元素，
-        # 表现为「已点击」但实际没触发发信）
-        try:
-            box = send_btn.bounding_box()
-            if box:
-                x = box["x"] + box["width"] / 2
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y, steps=random.randint(5, 12))
-                page.wait_for_timeout(random.randint(100, 300))
-                page.mouse.down()
-                page.wait_for_timeout(random.randint(60, 140))
-                page.mouse.up()
-                _log("已点击「发送验证码」（坐标点击）")
+        # ---- A. 拿到 token → 按站点协议直接发码 ----
+        tok = _acquire_ts_token(page)
+        token = tok.get("token") or ""
+        if token:
+            _log(f"已取得 Turnstile token（{len(token)} 字符，来源：{tok.get('via')}）")
+            res = _post_send_email(page, used_email, mode, token)
+            ok, detail = _judge_api_email(res)
+            if ok:
+                _log(f"✓ 验证码已发出（{detail}）")
+                return True, detail, used_email
+            _log(f"✗ 发码接口返回失败：{detail}")
+            best_detail = _better_detail(detail, best_detail)
+            if _looks_like_token_problem(detail):
+                # token 已被用过（或过期）：不能拿它去点按钮了，
+                # 必须让组件出一个新的再来。
+                _reset_ts_widget(page)
+            elif "没发出去" in detail:
+                # 网络异常，可以重试
+                pass
             else:
-                send_btn.click(timeout=5000)
-                _log("已点击「发送验证码」（locator 点击）")
-        except Exception as e:
-            _log(f"点击发送验证码失败：{type(e).__name__}")
-            continue
+                # 业务侧拒绝（频率限制、邮箱不存在等），再试几次也没用
+                return False, detail, used_email
+        else:
+            # ---- B. 拿不到 token：点站点自己的按钮，看站点给的真实提示 ----
+            # 站点没有 token 时会弹「请先通过人机验证」并且**一个请求都不发**，
+            # 这条提示才是真实原因——旧代码抓不到 .msc-confirm，
+            # 才会退化成一句没信息量的「20 秒内没看到任何接口响应」。
+            _log("⚠️ 没取到 Turnstile token（组件还没出 token，或取 token 的路径没命中）")
+            before = len(_api_log_window(page))
+            b_ok, b_detail = _click_send_and_watch(page, before)
+            if b_ok:
+                _log(f"✓ 验证码已发出（{b_detail}）")
+                return True, b_detail, used_email
+            if b_detail:
+                _log(f"✗ 第 {attempt}/{attempts} 次发码未成功：{b_detail}")
+                best_detail = _better_detail(b_detail, best_detail)
+            _reset_ts_widget(page)
 
-        # 等服务器的回话（最多 20 秒）
-        deadline = time.time() + 20
-        verdict = None
-        while time.time() < deadline:
-            page.wait_for_timeout(800)
-            new = _api_log_window(page)[before:]
-            if new:
-                send_entries = [e for e in new if _is_send_api(e.get("url") or "")]
-                if send_entries:
-                    verdict = _judge_send_response(send_entries, strict=True)
-                else:
-                    # 来源不确定的接口：光一个 2xx 不算数，继续等更明确的信号
-                    verdict = _judge_send_response(new, strict=False)
-                if verdict is not None:
-                    break
-                for e in new[-3:]:
-                    _dbg(f"发码接口响应：{e.get('url')} status={e.get('status')} "
-                         f"body={str(e.get('body'))[:200]}")
-            btn_text = _send_btn_text(page)
-            if _is_countdown(btn_text):
-                verdict = (True, f"按钮已进入倒计时（{btn_text}）")
-                break
-            notice = _page_notice_text(page)
-            if notice:
-                if _looks_like_sent(notice):
-                    verdict = (True, f"页面提示：{notice}")
-                    break
-                if _looks_like_error(notice):
-                    verdict = (False, f"页面提示：{notice}")
-                    break
-
-        if verdict is None:
-            verdict = (False, "点了按钮，但 20 秒内没看到任何接口响应")
-        ok, detail = verdict
-        if ok:
-            _log(f"✓ 验证码已发出（{detail}）")
-            return True, detail, used_email
-        _log(f"✗ 第 {attempt}/{attempts} 次发码未成功：{detail}")
-        # 重试可能拿到更含糊的原因，别把已经说清楚的那条覆盖掉
-        if "没看到任何接口响应" in detail and prev_detail:
-            detail = prev_detail
-        prev_detail = detail
         if attempt < attempts:
-            _log("重试：再等一次 Turnstile，然后重新点")
+            _log("重试：等 Turnstile 出新 token 再试")
             try:
                 _wait_turnstile(page, timeout=30, widget_only_ok=True)
             except Exception:
                 pass
-    return False, detail or "发码失败", used_email
+    return False, best_detail or detail or "发码失败", used_email
 
 
 def _handle_email_verify(page, redirect: str, username: str):
@@ -1281,7 +1679,10 @@ def _handle_email_verify(page, redirect: str, username: str):
             # 老版本这里无条件打印「Turnstile 已就绪」——哪怕什么都没等到。
             # 那样看日志的人会以为验证过了，其实发码请求很可能就是被它拒的。
             if ts:
-                _log("Turnstile 已就绪")
+                if ts == "widget-ok":
+                    _log("Turnstile 已就绪（组件显示通过；token 由组件内部持有，发码时现取）")
+                else:
+                    _log(f"Turnstile 已就绪（{len(ts)} 字符）")
             else:
                 _log("⚠️ Turnstile 30 秒内没确认通过（发码请求可能被拒，会重试）")
         except Exception as e:

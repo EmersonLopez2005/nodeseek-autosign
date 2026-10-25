@@ -223,6 +223,7 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 | 签到 403 但登录正常 | 签到这一步被 WAF 拦 | 用 `POST /sign` 让 agent 代签 |
 | 提示未配置 `CLOUDFREED_API_KEY` | 旧版遗留兜底逻辑 | 已修：默认不再调用 CloudFreed，不需要配 |
 | 收到「⚠️ 设备记忆失效」告警 | 这台设备之前登录过，这次仍要邮箱验证码 | NodeSeek 改了策略/你换了 IP。手动跑一次登录，再按[部署指南 6.5](部署指南_账号密码自动登录.md)配自动收码根治 |
+| 日志「❌ 验证码没发出去」 | 发码请求被服务器拒了，邮箱里不会有邮件 | 现在会直接读站点真实接口 `/api/email` 的返回原文。原因分三类：`接口返回失败（HTTP xxx）：…`＝服务器原话（多为频率限制）；`页面提示：请先通过人机验证`＝Turnstile 没出 token（多半 `challenges.cloudflare.com` 不可达）；`接口返回成功`＝已发出，去邮箱查收 |
 | 「当前不是交互式终端，无法手动输入验证码」 | cron 里跑且没配自动收码 | 配 `NS_CODE_FILE` / `NS_CODE_URL` / `NS_IMAP_*`（见部署指南 6.5） |
 | 想知道 30 天后要不要人工 | —— | `python3 diagnose_device_memory.py simulate` |
 
