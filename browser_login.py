@@ -165,6 +165,7 @@ def browser_login_detail(site_config, user, pwd, headless=True):
                 "expiry": r.get("expiry"),
                 "cookie_life": r.get("cookie_life"),
                 "device_memory_expired": bool(r.get("device_memory_expired")),
+                "needs_email_verify": bool(r.get("needs_email_verify")),
             }
         errors.append(f"{base}: {r.get('error')} {r.get('message', '')}")
         print(f"[browser_login] {base} 登录失败：{r.get('error')} {r.get('message', '')}")
@@ -197,6 +198,7 @@ def browser_login_detail(site_config, user, pwd, headless=True):
                 "expiry": result.get("expiry"),
                 "cookie_life": result.get("cookie_life"),
                 "device_memory_expired": bool(result.get("device_memory_expired")),
+                "needs_email_verify": bool(result.get("needs_email_verify")),
             }
         except Exception as e:
             # 这条以前只在有远程 agent 时才打印，导致单机模式下失败原因被完全吞掉

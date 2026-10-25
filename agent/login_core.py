@@ -759,45 +759,32 @@ def _signin_via_page_fetch(page, username: str, password: str):
 
 
 def _prior_login_traces(page) -> str:
-    """检查浏览器 profile 里是否留有「之前登录过这台设备」的痕迹。
+    """检查浏览器 profile 里是否留有「这台设备**成功登录过**」的痕迹。
 
     用途：区分两种「需要邮箱验证码」：
       · 首次在新设备/新 profile 上登录 → 要码是正常的
-      · 这台设备之前登录过（profile 里有痕迹），这次仍要码
-        → 说明 NodeSeek 侧的「记住设备」状态已经失效了（需要告警）
+      · 这台设备之前**登录成功过**（profile 里有 NodeSeek 登录态），
+        这次仍要码 → 说明 NodeSeek 侧的「记住设备」状态已经失效了（需要告警）
 
-    痕迹来源（都在同一 origin 的持久化存储里）：
-      · localStorage 里的 security_token（登录页前端会生成）
-      · profile 目录里存过的 NodeSeek cookie（登录态 cookie 已被清掉时只剩名字）
+    **2026-10-25 修正（重要，之前误报）**：
+    老实现拿 `cf_clearance` / `fog` / `hmti_` 当「登录过」的证据。
+    这三个是 **Cloudflare 与指纹服务**的 cookie，第一次访问站点就会留下，
+    跟 NodeSeek 的「记住设备」毫无关系——结果每个新机器第一次登录
+    都被误判成「设备记忆失效」（用户日志：profile 里有 cf_clearance/fog）。
+    现在只认 NodeSeek 自己的登录态 cookie（pjwt / session / smac）：
+    登录成功一次就会留在 profile 里（哪怕已过期），这才是可靠证据。
+
+    另：localStorage 里的 `security_token` 是**登录页前端每次访问都会生成**的
+    临时 token，同样不能作为「曾登录过」的证据，已从判定里移除。
+
     返回一段描述文字，没有痕迹则返回空串。
     """
     found = []
     try:
-        ls = page.evaluate(
-            """() => {
-                const out = [];
-                try {
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const k = localStorage.key(i);
-                        if (k) out.push(k);
-                    }
-                } catch (e) {}
-                return out;
-            }"""
-        )
-        if isinstance(ls, list) and ls:
-            for k in ls:
-                if k in ("security_token", "__ns_api_log"):
-                    found.append(k)
-    except Exception:
-        pass
-
-    try:
         names = [c.get("name") for c in (page.context.cookies() or [])]
-        # session/pjwt/smac 已经不在了（否则这轮就登录成功了），
-        # 但如果还留着 cf_clearance 之类的，说明这台设备确实来过。
-        if any(n in ("cf_clearance", "fog", "hmti_") for n in names):
-            found.append("cf_clearance/fog")
+        ns_auth = [n for n in ("pjwt", "session", "smac") if n in names]
+        if ns_auth:
+            found.append("/".join(ns_auth))
     except Exception:
         pass
 
@@ -1911,7 +1898,9 @@ def _handle_email_verify(page, redirect: str, username: str):
             _log("站内接口没能确认登录态（可能网络/风控），按 cookie 判定成功")
         _log("邮箱验证登录成功")
         _log(f"cookie 有效期：{describe_cookie_life(all_cookies)}")
-        return _login_result(cookie, all_cookies, username)
+        res = _login_result(cookie, all_cookies, username)
+        res["needs_email_verify"] = True
+        return res
 
     if left_email_page:
         _log("页面已离开 emailSignIn，但没抓到登录态 cookie，再探一次接口…")
@@ -1920,7 +1909,9 @@ def _handle_email_verify(page, redirect: str, username: str):
             all_cookies = page.context.cookies()
             cookie = cookies_to_string(all_cookies)
             _log(f"接口确认已登录，cookie：{_cookie_names(all_cookies)}")
-            return _login_result(cookie, all_cookies, username)
+            res = _login_result(cookie, all_cookies, username)
+            res["needs_email_verify"] = True
+            return res
 
     # 没拿到登录态：把服务器原文打出来，看它到底说了什么
     api_log = _read_api_log(page)
@@ -2620,12 +2611,12 @@ def login(page, username: str, password: str, totp_secret: Optional[str] = None,
             #   · 没痕迹 → 首次登录，正常流程，本来就该要码
             prior = _prior_login_traces(page)
             if prior:
-                _log(f"⚠️ 这台设备之前登录过（profile 里有 {prior}），本次仍要求邮箱验证")
+                _log(f"⚠️ 这台设备之前**登录成功过**（profile 里有 {prior}），本次仍要求邮箱验证")
                 _log("   → 说明 NodeSeek 侧的「记住设备」状态可能已过期，"
                      "或换了出口 IP / 换了浏览器指纹")
                 device_memory_expired = True
             else:
-                _log("首次在新设备上登录，需要邮箱验证码属正常流程")
+                _log("首次在这台设备上登录，需要邮箱验证码属正常流程")
                 device_memory_expired = False
 
             _log(f"密码验证通过，但需要二次验证，redirect={redirect}")

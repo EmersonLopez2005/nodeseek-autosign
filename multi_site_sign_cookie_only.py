@@ -590,10 +590,31 @@ def recover_cookie(site_name, site_config, account_index, user, pwd):
     用于「主动续期」——快到期时提前换新，别等 cookie 掉了才发现。
     """
     meta = {}
+
+    # 这台设备（这个 profile + 这个出口 IP）之前**登录成功过**吗？
+    # 记在 cookie meta 里（比浏览器 cookie 更持久，浏览器清了也还在）。
+    #
+    # 这是判断「设备记忆是否真的失效」的权威依据：
+    #   曾登录成功过 + 本次仍要邮箱码 → 设备记忆确实失效 → 该告警
+    #   从没登录成功过              → 首次在新设备上登录，正常流程 → 不告警
+    #
+    # 2026-10-25 修正：之前拿 profile 里的 cf_clearance/fog 当「登录过」的证据，
+    # 那是 Cloudflare 与指纹服务的 cookie，第一次访问就会留，
+    # 结果每个新机器第一次登录都误报「设备记忆失效」。
+    prev_meta = load_cookie_meta(site_name, account_index) or {}
+    prior_logged_in = bool(prev_meta.get("device_logged_in"))
+
     if PLAYWRIGHT_AVAILABLE and browser_login_detail:
         print("尝试浏览器登录（本地 / 家宽 agent）...")
         r = browser_login_detail(site_config, user, pwd, headless=True)
         cookie = (r or {}).get("cookie")
+        # 本次是否被要求了邮箱二次验证
+        needs_code = bool((r or {}).get("needs_email_verify"))
+        # login_core 的判定：本次要码 且 profile 里有 NodeSeek 登录态痕迹
+        dme = bool((r or {}).get("device_memory_expired")) and needs_code
+        # 历史判定：这台设备曾登录成功过，这次仍要码 → 记忆确实失效
+        if needs_code and prior_logged_in:
+            dme = True
         if cookie:
             save_cookie_to_file(site_name, cookie, account_index)
             meta = {
@@ -601,12 +622,17 @@ def recover_cookie(site_name, site_config, account_index, user, pwd):
                 "ts": time.time(),
                 "expiry": r.get("expiry"),
                 "cookie_life": r.get("cookie_life"),
-                "device_memory_expired": bool(r.get("device_memory_expired")),
+                "device_memory_expired": dme,
+                # 登录成功 → 记下「这台设备登录成功过」，下次据此判断设备记忆
+                "device_logged_in": True,
+                "needs_email_verify": needs_code,
             }
             save_cookie_meta(site_name, account_index, meta)
+            if needs_code:
+                print(f"本次走了邮箱二次验证（这台设备曾登录成功过：{prior_logged_in}）")
             return cookie, meta
         print("浏览器登录未成功")
-        if (r or {}).get("device_memory_expired"):
+        if dme:
             meta["device_memory_expired"] = True
 
     if os.getenv("ALLOW_CLOUDFREED", "").strip().lower() in ("1", "true", "yes"):
@@ -659,6 +685,7 @@ def process_site(site_name, site_config, ns_random):
         meta = load_cookie_meta(site_name, idx)
         renew_threshold = float(os.getenv("NS_RENEW_BEFORE_DAYS", "5") or 5)
         device_memory_expired = False
+        email_verify_used = False
 
         # ---- 主动续期 ----
         # NodeSeek 的登录 cookie 约 30 天过期。等它掉了才重登，很可能撞上
@@ -676,6 +703,10 @@ def process_site(site_name, site_config, ns_random):
                     if new_cookie:
                         cookie = new_cookie
                         meta = new_meta or meta
+                        # 主动续期同样可能撞上「设备记忆失效」，
+                        # 这里要同步状态，否则告警会漏。
+                        device_memory_expired = bool(meta.get("device_memory_expired"))
+                        email_verify_used = bool(meta.get("needs_email_verify"))
                         print("主动续期完成")
                     else:
                         print("主动续期失败，继续用现有 Cookie 尝试")
@@ -695,6 +726,7 @@ def process_site(site_name, site_config, ns_random):
         if not cookie:
             cookie, meta = recover_cookie(site_name, site_config, idx, user, pwd)
             device_memory_expired = bool(meta.get("device_memory_expired"))
+            email_verify_used = bool(meta.get("needs_email_verify"))
 
         if not cookie:
             print("放弃: 无法获取有效Cookie")
@@ -707,6 +739,7 @@ def process_site(site_name, site_config, ns_random):
                 'status': 'fail',
                 'msg': msg,
                 'device_memory_expired': device_memory_expired,
+                'email_verify_used': email_verify_used,
             })
             continue
 
@@ -719,6 +752,7 @@ def process_site(site_name, site_config, ns_random):
             if new_cookie:
                 cookie = new_cookie
                 device_memory_expired = bool(new_meta.get("device_memory_expired"))
+                email_verify_used = bool(new_meta.get("needs_email_verify"))
                 status, msg = sign(cookie, site_config, ns_random)
                 print(f"重试签到结果: {msg}")
             else:
@@ -736,6 +770,7 @@ def process_site(site_name, site_config, ns_random):
             'msg': msg,
             'stats': stats,
             'device_memory_expired': device_memory_expired,
+            'email_verify_used': email_verify_used,
         })
 
     # === 设备记忆失效告警 ===
@@ -745,13 +780,17 @@ def process_site(site_name, site_config, ns_random):
     # 用独立通道推送，不受「今日已通知过」的限制。
     dme = [r for r in site_results if r.get('device_memory_expired')]
     if dme:
-        lines = "\n".join(f"· {r['user']}：{r['msg']}" for r in dme)
+        lines = "\n".join(
+            f"· {r['user']}：本次{'走了邮箱二次验证' if r.get('email_verify_used') else '仍被要求邮箱验证码'}"
+            f"（签到结果：{r['msg']}）"
+            for r in dme
+        )
         alert = (
             "⚠️ NodeSeek「记住设备」疑似已失效\n"
             f"{lines}\n\n"
-            "这台设备之前登录过，这次仍被要求邮箱验证码。\n"
-            "含义：NodeSeek 侧的设备记忆过期了（或出口IP/浏览器指纹变了），\n"
-            "      以后每次 cookie 失效都可能要人工收码。\n\n"
+            "这台设备之前**登录成功过**，这次却仍被要求邮箱验证码。\n"
+            "含义：NodeSeek 侧的设备记忆可能已过期，或出口 IP / 浏览器指纹变了。\n"
+            "      后果是以后每次 cookie 失效（约 30 天）都要人工收一次码。\n\n"
             "处理：\n"
             "1) 手动跑一次登录完成邮箱验证，让它重新记住这台设备\n"
             "   cd /root/nodeseek-autosign && .venv/bin/python multi_site_sign_cookie_only.py\n"

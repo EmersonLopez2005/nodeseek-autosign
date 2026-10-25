@@ -188,6 +188,8 @@ def api_login():
             "expiry": result.get("expiry"),
             "cookie_life": result.get("cookie_life"),
             "device_memory_expired": bool(result.get("device_memory_expired")),
+            # 本次是否走了邮箱二次验证（上层据此判断「这台设备曾登录成功过吗」）
+            "needs_email_verify": bool(result.get("needs_email_verify")),
         })
         cost = round(time.time() - started, 1)
         print(f"[login] 成功 {account} 用时 {cost}s "
@@ -201,6 +203,7 @@ def api_login():
             "expiry": result.get("expiry"),
             "cookie_life": result.get("cookie_life"),
             "device_memory_expired": bool(result.get("device_memory_expired")),
+            "needs_email_verify": bool(result.get("needs_email_verify")),
             "cost": cost,
             "engine": resolve_engine(ENGINE),
         })
@@ -214,6 +217,7 @@ def api_login():
             "error": e.code,
             "message": e.message,
             "device_memory_expired": bool(getattr(e, "device_memory_expired", False)),
+            "needs_email_verify": e.code == "NEED_EMAIL_VERIFY",
             "cost": round(time.time() - started, 1),
         }), code
     except Exception as e:
