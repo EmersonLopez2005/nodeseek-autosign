@@ -13,6 +13,7 @@
 #
 # 用法：bash run_sign.sh          （正常跑，输出写进 logs/sign.log）
 #       bash run_sign.sh --now    （忽略锁，立刻跑一次）
+#       bash run_sign.sh --dryrun （只检查环境与依赖，不实际签到）
 
 set -uo pipefail
 
@@ -44,15 +45,91 @@ for c in "$APP_DIR/.venv/bin/python" "$APP_DIR/venv/bin/python" \
   if [ -n "$c" ] && [ -x "$c" ]; then PY="$c"; break; fi
 done
 
-{
-  echo ""
-  echo "================ [$(ts)] 定时签到开始 ================"
-} >> "$LOG_FILE"
+DRYRUN=0
+[ "${1:-}" = "--dryrun" ] && DRYRUN=1
+
+# 预演模式：**不写 sign.log、不写心跳**。
+# 它只是给人看的诊断输出，混进签到日志里会让人分不清哪段是预演、哪段是真签到。
+if [ "$DRYRUN" != "1" ]; then
+  {
+    echo ""
+    echo "================ [$(ts)] 定时签到开始 ================"
+  } >> "$LOG_FILE"
+fi
 
 if [ -z "$PY" ]; then
-  echo "[$(ts)] ✗ 找不到 python 解释器（试过 .venv/bin/python / venv/bin/python / python3）" >> "$LOG_FILE"
-  printf 'last_run=%s\nstatus=no_python\n' "$(ts)" > "$HEARTBEAT"
+  if [ "$DRYRUN" != "1" ]; then
+    echo "[$(ts)] ✗ 找不到 python 解释器（试过 .venv/bin/python / venv/bin/python / python3）" >> "$LOG_FILE"
+    printf 'last_run=%s\nstatus=no_python\n' "$(ts)" > "$HEARTBEAT"
+  fi
   exit 127
+fi
+
+# ---------------------------------------------------------------- 预演模式
+# 只检查「cron 环境里能不能跑通」，不实际发起签到请求。
+# 用途：手动跑好好的、cron 里跑失败时，用它来定位是环境问题还是逻辑问题。
+if [ "$DRYRUN" = "1" ]; then
+  echo "[$(ts)] ===== 预演模式（不实际签到，不写日志）====="
+  echo "[$(ts)] 解释器     : $PY"
+  echo "[$(ts)] HOME       : ${HOME:-（未设置！）}"
+  echo "[$(ts)] PATH       : $PATH"
+  echo "[$(ts)] DISPLAY    : ${DISPLAY:-（未设置）}"
+  echo "[$(ts)] 工作目录   : $APP_DIR"
+  echo "[$(ts)] 当前用户   : $(id -un 2>/dev/null || echo '?')"
+
+  FAIL=0
+  check() {
+    if eval "$2"; then
+      echo "[$(ts)]   ✅ $1"
+    else
+      echo "[$(ts)]   ❌ $1"
+      FAIL=1
+    fi
+  }
+  echo "[$(ts)] --- 依赖检查 ---"
+  check "工作目录存在"           "[ -d '$APP_DIR' ]"
+  check ".env 存在"              "[ -f '$APP_DIR/.env' ]"
+  check "解释器可执行"           "[ -x '$PY' ]"
+  check "curl_cffi 已安装"       "'$PY' -c 'import curl_cffi' >/dev/null 2>&1"
+  check "python-dotenv 已安装"   "'$PY' -c 'import dotenv' >/dev/null 2>&1"
+  check "requests 已安装"        "'$PY' -c 'import requests' >/dev/null 2>&1"
+
+  echo "[$(ts)] --- cookie 状态 ---"
+  if [ -d "$APP_DIR/cookie" ]; then
+    CNT=$(ls -1 "$APP_DIR/cookie" 2>/dev/null | grep -c '\.txt$' || true)
+    echo "[$(ts)]   cookie 文件数: $CNT"
+    if [ "${CNT:-0}" -gt 0 ]; then
+      echo "[$(ts)]   ✅ 有现成 cookie —— 日常签到只发 HTTP 请求，不需要浏览器"
+    else
+      echo "[$(ts)]   ⚠️  没有 cookie —— 下次运行需要走浏览器登录（cron 里没法交互）"
+    fi
+  else
+    echo "[$(ts)]   ⚠️  没有 cookie/ 目录"
+  fi
+
+  echo "[$(ts)] --- 浏览器能力（只在 cookie 失效续期时才会用到）---"
+  if [ -n "${DISPLAY:-}" ]; then
+    echo "[$(ts)]   ✅ 有 DISPLAY=$DISPLAY"
+  elif command -v Xvfb >/dev/null 2>&1; then
+    echo "[$(ts)]   ✅ 无 DISPLAY，但装了 Xvfb —— browser_engine 会自动拉起虚拟屏"
+  else
+    echo "[$(ts)]   ⚠️  无 DISPLAY 且没装 Xvfb —— 浏览器登录会失败（apt install -y xvfb）"
+  fi
+
+  echo "[$(ts)] --- 锁 ---"
+  if command -v flock >/dev/null 2>&1; then
+    echo "[$(ts)]   ✅ flock 可用：$(command -v flock)"
+  else
+    echo "[$(ts)]   ⚠️  没有 flock —— 并发时可能重复签到（apt install -y util-linux）"
+  fi
+
+  echo "[$(ts)] ===== 预演结束 ===="
+  if [ "$FAIL" = "0" ]; then
+    echo "[$(ts)] 结果：环境检查通过"
+    exit 0
+  fi
+  echo "[$(ts)] 结果：环境检查**未通过**（见上面 ❌）"
+  exit 1
 fi
 
 # ---------------------------------------------------------------- 文件锁

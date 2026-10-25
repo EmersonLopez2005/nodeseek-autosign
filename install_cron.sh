@@ -108,6 +108,13 @@ fi
 
 # ---------------------------------------------------------------- 诊断
 if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
+  # 诊断脚本必须「尽力把信息打完」——
+  # 之前忘了关 set -e，而下面那些 grep 在「没找到」时返回 1，
+  # 于是一旦日志里没有匹配项，整个脚本就在半路被杀掉，
+  # 输出停在 2.5 节，第 3~7 节（心跳 / 签到日志 / cookie 状态）全看不到。
+  # 诊断工具自己断了，比什么都误导人。
+  set +e
+
   echo "=== 1. crontab 里有没有本项目的条目 ==="
   if crontab -l 2>/dev/null | grep -q "$TAG"; then
     crontab -l 2>/dev/null | grep -A1 "$TAG"
@@ -148,14 +155,14 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo "=== 2.5 cron 自己的日志（看它到底执行过没有）==="
   LOGSHOWN=0
   if command -v journalctl >/dev/null 2>&1; then
-    OUT="$(journalctl -u cron --since "3 days ago" --no-pager 2>/dev/null | tail -n 25)"
+    OUT="$(journalctl -u cron --since "3 days ago" --no-pager 2>/dev/null | tail -n 25 || true)"
     if [ -n "$OUT" ]; then
       echo "$OUT"
       LOGSHOWN=1
     fi
   fi
   if [ "$LOGSHOWN" = "0" ] && [ -f /var/log/syslog ]; then
-    grep -a "CRON" /var/log/syslog 2>/dev/null | tail -n 25
+    grep -a "CRON" /var/log/syslog 2>/dev/null | tail -n 25 || true
     LOGSHOWN=1
   fi
   if [ "$LOGSHOWN" = "0" ]; then
@@ -165,15 +172,16 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo "  --- 我们的条目被 cron 执行过的记录（cron 成功触发时会打这一行）---"
   HITS=""
   if [ -f /var/log/syslog ]; then
-    HITS="$(grep -a "run_sign.sh" /var/log/syslog 2>/dev/null | tail -n 10)"
+    HITS="$(grep -a "run_sign.sh" /var/log/syslog 2>/dev/null | tail -n 10 || true)"
   fi
   if [ -z "$HITS" ] && command -v journalctl >/dev/null 2>&1; then
-    HITS="$(journalctl -u cron --since "7 days ago" --no-pager 2>/dev/null | grep -a "run_sign.sh" | tail -n 10)"
+    HITS="$(journalctl -u cron --since "7 days ago" --no-pager 2>/dev/null | grep -a "run_sign.sh" | tail -n 10 || true)"
   fi
   if [ -n "$HITS" ]; then
     echo "$HITS"
   else
     echo "  ❌ 没有任何执行记录 —— cron 从来没触发过这条任务"
+    echo "     （如果刚装上还没到点，这行是正常的；等到点后再看一次）"
   fi
 
   echo
@@ -215,6 +223,42 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   echo
   echo "=== 7. 想确认 cron 真的会执行？跑一次实测 ==="
   echo "  bash install_cron.sh --selftest    # 临时装一条每分钟的条目，看它跑不跑"
+  echo "  bash install_cron.sh --dryrun      # 用 cron 的极简环境预演一次（不实际签到）"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 预演
+# 用「cron 的真实环境」跑一遍我们那条命令，但不真的签到。
+# 目的：提前暴露「手动跑正常、cron 里跑失败」的那类问题
+# （PATH 太短找不到 python、没有 HOME 读不到 .env、没有 DISPLAY 起不了浏览器）。
+# --selftest 只能证明 cron 会执行条目，证明不了我们的条目内容是对的。
+if [ "${1:-}" = "--dryrun" ] || [ "${1:-}" = "dryrun" ]; then
+  echo "=== cron 环境预演（不实际签到）==="
+  echo "模拟 cron 的极简环境：无 DISPLAY / 无 tty / 短 PATH / 只有 HOME"
+  echo
+
+  # cron 实际会给的最小环境（参考 Debian cron 的默认 env）
+  RUNNER="$APP_DIR/run_sign.sh"
+  [ -f "$RUNNER" ] || { echo "✗ 找不到 $RUNNER"; exit 1; }
+
+  echo "--- 用 env -i 清空环境后执行 run_sign.sh --dryrun ---"
+  echo
+  if env -i \
+      HOME="${HOME:-/root}" \
+      PATH="/usr/bin:/bin" \
+      SHELL="/bin/sh" \
+      /bin/bash "$RUNNER" --dryrun 2>&1; then
+    echo
+    echo "✅ 预演通过 —— cron 环境里能跑通"
+  else
+    echo
+    echo "❌ 预演失败 —— 这就是 cron 里跑不起来的原因（上面的错误就是根因）"
+    exit 1
+  fi
+
+  echo
+  echo "提示：预演只检查「环境与依赖」，不会真的签到。"
+  echo "      想真跑一次签到：bash run_sign.sh"
   exit 0
 fi
 

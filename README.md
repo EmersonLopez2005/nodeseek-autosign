@@ -165,6 +165,16 @@ bash install_cron.sh --selftest
 
 它会临时装一条每分钟执行的条目，看它有没有真的跑起来，测完自动还原你的 crontab。
 
+> `--selftest` 只能证明「**cron 会执行条目**」，证明不了「**我们这条条目的内容是对的**」。
+> 后者用 `--dryrun`：它用 `env -i` 清空环境，模拟 cron 的极简环境
+> （无 DISPLAY / 无 tty / 只有 HOME 和短 PATH）跑一遍 `run_sign.sh`，
+> 提前暴露「手动跑正常、cron 里跑失败」的那类问题。
+> 它**不会真的签到**，也不写日志。
+
+```bash
+bash install_cron.sh --dryrun
+```
+
 **日志在哪、怎么查**：
 
 | 文件 | 内容 |
@@ -179,8 +189,15 @@ bash install_cron.sh --selftest
 bash install_cron.sh --status
 ```
 
-它会依次检查：crontab 条目在不在 → cron 服务在不在跑 → 时区对照 →
-上次运行记录 → 签到日志尾部 40 行 → cookie 与通知状态。
+它会依次检查：crontab 条目在不在 → cron 服务在不在跑 → **cron 自己的执行日志** →
+**我们条目被触发过的记录** → 时区对照 → 上次运行记录 → 签到日志尾部 40 行 →
+cookie 与通知状态。
+
+> ⚠️ 刚装上时，「我们条目被 cron 执行过的记录」是空的 —— 那时还没到点，属正常。
+> 到点后再跑一次 `--status`，那一栏应该出现 `(root) CMD (.../run_sign.sh)`。
+>
+> 如果那一栏**一直**是空的，说明 cron 根本没触发我们这条：
+> 先 `bash install_cron.sh --selftest`（cron 通不通），再 `bash install_cron.sh --dryrun`（条目内容对不对）。
 
 > **无人值守的前提**：浏览器 profile 里已经记住了这台设备（第一次手动跑过一次登录）。
 > 之后日常签到只发两个 HTTP 请求，不开浏览器、不需要验证码。
