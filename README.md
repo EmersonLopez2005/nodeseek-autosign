@@ -131,10 +131,20 @@ vi .env            # NS_USER_PASS=用户名&密码
 
 跑通了再接定时任务：
 
+```bash
+cd /root/nodeseek-autosign
+bash install_cron.sh
+```
+
+脚本会自动按**北京时间**换算本机时区的触发时刻（服务器在 UTC / 美国 / 欧洲都不会错位），
+默认北京时间 **00:10** 触发 —— NodeSeek 每日签到状态在**北京时间 0~2 点刷新**，
+刷新后越早签到，当天签到人数越少，「试试手气」越容易抽到高值。
+
+生成的 crontab 条目长这样（分钟/小时是**本机时区**）：
+
 ```cron
-# 每天 08:10（分钟数故意错开，避免固定特征）
-# flock 防止上一轮没跑完就叠一轮；日志落在项目 logs/ 下
-10 8 * * * cd /root/nodeseek-autosign && mkdir -p logs && flock -n /tmp/nodeseek-sign.lock .venv/bin/python multi_site_sign_cookie_only.py >> logs/sign.log 2>&1
+# nodeseek-autosign 每日签到
+10 0 * * * cd /root/nodeseek-autosign && mkdir -p logs && flock -n /tmp/nodeseek-sign.lock .venv/bin/python multi_site_sign_cookie_only.py >> logs/sign.log 2>&1
 ```
 
 > **无人值守的前提**：浏览器 profile 里已经记住了这台设备（第一次手动跑过一次登录）。
@@ -144,6 +154,8 @@ vi .env            # NS_USER_PASS=用户名&密码
 > 换新用的是同一个 profile，NodeSeek 记得这台设备 → 依然不需要验证码。
 > 万一设备记忆真的失效了，你会收到一条「⚠️ 设备记忆失效」的 Telegram 告警，
 > 里面直接写着该怎么做 —— 不会静默失败好几天。
+>
+> 改时间 / 卸载：`NS_SIGN_BJ_TIME=07:20 bash install_cron.sh` / `bash install_cron.sh --remove`
 
 ---
 
@@ -203,12 +215,12 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 | `AGENT_ENGINE` | auto | `patchright` / `camoufox` / `playwright` |
 | `AGENT_PROXY` | 空 | 给浏览器挂代理，如 `http://user:pass@host:port` |
 | `NS_TOTP_SECRET` | 空 | 账号开了 2FA 时填 Base32 密钥 |
+| `NS_RANDOM` | true | 签到奖励方式：`true` =「试试手气」（随机 1~5 鸡腿），`false` = 固定「鸡腿 x 5」 |
 | `NS_RENEW_BEFORE_DAYS` | 5 | cookie 剩余寿命不足几天就主动换新（设 0 关闭） |
 | `NS_CODE_FILE` | 空 | 验证码落地文件路径（自动收码，不需要交出邮箱密码） |
 | `NS_CODE_URL` | 空 | HTTP 取码地址，返回纯文本验证码 |
 | `NS_IMAP_HOST` / `NS_IMAP_USER` / `NS_IMAP_PASS` | 空 | IMAP 自动收码（用邮箱授权码，不是登录密码） |
 | `NS_CODE_TIMEOUT` | 180 | 等验证码的最长秒数 |
-| `NS_RANDOM` | true | 签到时间随机抖动 |
 | `TG_BOT_TOKEN` / `TG_USER_ID` | 空 | Telegram 推送 |
 
 通知渠道全部通过环境变量配，不用改代码，支持：

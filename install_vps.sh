@@ -260,7 +260,10 @@ cat <<EOF
   2) 用真账号试一次
        cd $APP_DIR && $VENV/bin/python multi_site_sign_cookie_only.py
 
-  3) 青龙（跑在 docker 里时，用宿主机网桥地址访问 agent）
+  3) 配每日定时（自动按北京时间换算本机时区，不会错位）
+       cd $APP_DIR && bash install_cron.sh
+
+  4) 青龙（跑在 docker 里时，用宿主机网桥地址访问 agent）
        LOGIN_AGENT_URL=http://172.17.0.1:${PORT:-3000}
        LOGIN_AGENT_TOKEN=<.env 里的 AGENT_TOKEN>
 
