@@ -143,9 +143,29 @@ bash install_cron.sh
 生成的 crontab 条目长这样（分钟/小时是**本机时区**）：
 
 ```cron
-# nodeseek-autosign 每日签到
-10 0 * * * cd /root/nodeseek-autosign && mkdir -p logs && flock -n /tmp/nodeseek-sign.lock .venv/bin/python multi_site_sign_cookie_only.py >> logs/sign.log 2>&1
+# nodeseek-autosign 每日签到（北京时间 00:10 触发，本机 00:10）
+HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin 10 0 * * * cd /root/nodeseek-autosign && mkdir -p logs && bash /root/nodeseek-autosign/run_sign.sh >> logs/cron.log 2>&1
 ```
+
+条目只调一行 `run_sign.sh`，真正的逻辑（文件锁、跑哪个 python、记心跳）都在脚本里 ——
+crontab 的命令行对 `%` 和引号极其敏感，逻辑写进去容易出「静默不执行」的怪问题。
+
+**日志在哪、怎么查**：
+
+| 文件 | 内容 |
+|---|---|
+| `logs/sign.log` | 签到过程的完整输出（每次运行带 `==== 定时签到开始/结束 ====` 分隔） |
+| `logs/cron.log` | cron 层面的报错（命令找不到、权限问题等） |
+| `logs/last_run.txt` | **心跳**：上次运行时间 + 退出码，一眼看出定时任务到底跑没跑 |
+
+一条命令全看完：
+
+```bash
+bash install_cron.sh --status
+```
+
+它会依次检查：crontab 条目在不在 → cron 服务在不在跑 → 时区对照 →
+上次运行记录 → 签到日志尾部 40 行 → cookie 与通知状态。
 
 > **无人值守的前提**：浏览器 profile 里已经记住了这台设备（第一次手动跑过一次登录）。
 > 之后日常签到只发两个 HTTP 请求，不开浏览器、不需要验证码。
