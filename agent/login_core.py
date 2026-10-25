@@ -347,7 +347,7 @@ def _click_turnstile_checkbox(page) -> bool:
     return False
 
 
-def _wait_turnstile(page, timeout=40):
+def _wait_turnstile(page, timeout=40, widget_only_ok=False):
     """等 Turnstile 完成验证。
 
     实测教训（2026-10，AT&T 住宅 IP，Xvfb 有头 patchright）：
@@ -360,6 +360,13 @@ def _wait_turnstile(page, timeout=40):
     （只有明确 error 才允许再点一次）。
 
     返回 token / "widget-ok"；拿不到明确信号返回 None（交给提交结果判断）。
+
+    widget_only_ok=True 时（邮箱验证页用）：
+      NodeSeek 走 Turnstile 的 **callback 模式**，token 只存在页面 JS 变量里，
+      **不会写进 input[name="cf-turnstile-response"]**。
+      所以「读不到 token」不代表没通过——唯一的可靠依据是组件状态 success。
+      这种模式下只要组件显示通过就立刻返回，别再空等满超时
+      （之前就是白等 30 秒，然后还打印一句误导性的「Turnstile 已就绪」）。
     """
     start = time.time()
     deadline = start + timeout
@@ -368,6 +375,7 @@ def _wait_turnstile(page, timeout=40):
     last_state = None
     last_tok = None
     tok_stable = 0
+    success_at = None
 
     # 组件是异步渲染的，太早点会点到空白处；
     # 顺便像人一样晃一下鼠标——整个会话期间鼠标从没动过，本身就很可疑
@@ -391,7 +399,17 @@ def _wait_turnstile(page, timeout=40):
             _log(f"Turnstile 验证通过（{len(tok)} 字符）")
             return tok
         if state == "success":
+            if widget_only_ok:
+                # callback 模式：token 不落 hidden input，组件 success 就是通过
+                _log("Turnstile 组件已显示验证通过（callback 模式，token 不落 hidden input）")
+                return "widget-ok"
             _dbg(f"Turnstile 组件已通过（{time.time() - start:.0f}s），但没读到 token，继续等")
+            if success_at is None:
+                success_at = time.time()
+            elif time.time() - success_at > 12:
+                # 连着 12 秒都是 success 状态却读不到 token —— 判定就是 callback 模式
+                _log("Turnstile 组件持续显示通过（callback 模式），按已验证处理")
+                return "widget-ok"
         elif tok:
             # 有 token 但组件状态不是 success：可能是状态误判。
             # 若同一个 token 连续多轮稳定存在，说明验证其实已经完成、token 新鲜，
@@ -914,12 +932,315 @@ def _poll_code_imap(timeout: int) -> str:
     return ""
 
 
+def _json_msg(body: str) -> str:
+    """从 JSON 响应体里挖出错误/提示信息。"""
+    try:
+        d = json.loads(body)
+    except Exception:
+        return ""
+    if isinstance(d, dict):
+        for k in ("message", "msg", "error", "errMsg", "errmsg", "data"):
+            v = d.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _looks_like_error(text: str) -> bool:
+    """一段文字看起来像失败提示吗？"""
+    t = (text or "").lower()
+    keys = ("失败", "错误", "频繁", "无效", "过期", "不允许", "被拒", "不存在",
+            "error", "invalid", "too many", "rate limit", "denied", "expired")
+    return any(k in t for k in keys)
+
+
+def _looks_like_sent(text: str) -> bool:
+    """一段文字看起来像「已发送」的成功提示吗？"""
+    t = (text or "").lower()
+    keys = ("已发送", "发送成功", "已发", "sent successfully", "send success")
+    return any(k in t for k in keys)
+
+
+def _is_send_api(url: str) -> bool:
+    """这个接口看起来像「发验证码」吗？（用来从一堆 API 响应里挑出对的那个）"""
+    u = (url or "").lower()
+    return any(k in u for k in ("send", "code", "email", "verify", "captcha"))
+
+
+def _api_log_window(page) -> list:
+    """读当前页面的 API 响应记录（只看 window 上的那份，避免和 localStorage 混淆）。"""
+    try:
+        log = page.evaluate("() => window.__ns_api_log || []")
+        return log if isinstance(log, list) else []
+    except Exception:
+        return []
+
+
+def _send_btn_text(page) -> str:
+    """读「发送验证码」按钮当前的文字。"""
+    try:
+        return page.evaluate(
+            """() => {
+                for (const b of document.querySelectorAll('button')) {
+                    const t = (b.innerText || '').trim();
+                    if (t && /发送|重发|秒|重新/.test(t)) return t;
+                }
+                return '';
+            }"""
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _is_countdown(text: str) -> bool:
+    """按钮文字是不是变成了倒计时（「60s 后重发」之类）——说明发码请求被接受了。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.search(r"\d+\s*(?:s|秒)", t):
+        return True
+    return _looks_like_sent(t)
+
+
+def _page_notice_text(page) -> str:
+    """页面上冒出来的提示文字（发码成功/失败的消息通常在这里）。"""
+    try:
+        return (page.evaluate(
+            """() => {
+                for (const sel of ['.msc-alert', '.modal.show', '[role="dialog"]',
+                                   '.swal2-container', '.invalid-feedback',
+                                   '[class*="toast"]', '[class*="Toast"]']) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' ||
+                            st.opacity === '0') continue;
+                        const t = (el.innerText || '').trim();
+                        if (t) return t.slice(0, 300);
+                    }
+                }
+                return '';
+            }"""
+        ) or "").strip()
+    except Exception:
+        return ""
+
+
+def _judge_send_response(entries: list, strict: bool = False):
+    """从发码接口的响应里判断成功/失败。
+
+    返回 (ok, detail)；没有结论时返回 None。
+
+    strict=True 表示这些条目已经确认是「发验证码」接口的响应，
+    此时 HTTP 2xx 即视为发码成功；strict=False（来源不确定）时，
+    光一个 2xx 不算数，返回 None 继续等更明确的信号（按钮倒计时/页面提示）。
+    """
+    for item in entries:
+        body = (item.get("body") or "").strip()
+        status = item.get("status")
+        if not body:
+            # 没有 body 但状态码是 4xx/5xx —— 也是失败
+            if isinstance(status, int) and status >= 400:
+                return False, f"接口返回 HTTP {status}"
+            continue
+        norm = body.replace(" ", "").lower()
+        # 失败信号优先，免得把 {"success":false,...} 误判成成功
+        if '"success":false' in norm:
+            msg = _json_msg(body)
+            return False, f"接口明确返回失败：{msg or body[:200]}"
+        if '"success":true' in norm:
+            msg = _json_msg(body)
+            return True, f"接口返回成功：{msg or body[:120]}"
+        if '"code":0' in norm or '"status":200' in norm:
+            return True, f"接口返回成功：{body[:120]}"
+        msg = _json_msg(body)
+        if msg and _looks_like_error(msg):
+            return False, f"接口返回：{msg}"
+        if _looks_like_error(body):
+            return False, f"接口返回：{body[:200]}"
+        if strict and isinstance(status, int) and 200 <= status < 300:
+            return True, f"接口 HTTP {status}"
+    return None
+
+
+def _fill_email_field(page, email_hint: str) -> tuple:
+    """在邮箱验证页上把邮箱填好。
+
+    **必须在点「发送验证码」之前调用。**
+    这个页面的发码请求体里带邮箱地址，框是空的话请求根本发不出去
+    （或者发到空地址），表现就是「日志说点了发送验证码，但邮箱里什么都没有」。
+    这正是「新机器部署又没收到验证码」的根因：新 profile 上前端不会自动填邮箱。
+
+    返回 (是否可用, 邮箱地址)。
+    页面自己已经填好了就直接用页面上的值 —— redirect 里没带 email 参数时，
+    这是唯一能拿到收件地址的机会。
+    """
+    email_input = _first_visible(
+        page,
+        ["input[placeholder='Email']", 'input[placeholder*="Email"]',
+         'input[type="email"]', "input[name='email']"],
+        timeout=5000,
+    )
+    if email_input is None:
+        _log("⚠️ 找不到邮箱输入框")
+        return False, ""
+    cur = ""
+    try:
+        cur = (email_input.input_value() or "").strip()
+    except Exception:
+        pass
+    if cur:
+        _log(f"邮箱框已有值：{cur}")
+        return True, cur
+    if not email_hint:
+        _log("⚠️ 拿不到绑定邮箱（redirect 里没解析出 email 参数，页面也没自动填）")
+        return False, ""
+    if not _fill_input_safe(email_input, email_hint, "邮箱框"):
+        return False, ""
+    page.wait_for_timeout(300)
+    filled = ""
+    try:
+        filled = (email_input.input_value() or "").strip()
+    except Exception:
+        pass
+    if filled != email_hint.strip():
+        _log(f"⚠️ 邮箱框回读不一致：期望 {email_hint!r}，实际 {filled!r}")
+        return False, ""
+    _log(f"已填入邮箱：{filled}")
+    return True, filled
+
+
+def _send_email_code(page, email_hint: str, attempts: int = 3) -> tuple:
+    """点「发送验证码」，并确认邮件真的发出去了。
+
+    返回 (是否发出, 详情说明, 实际使用的邮箱地址)。
+
+    为什么不能「点了就当成功」：发码请求可能被服务器拒（Turnstile 没通过、
+    频率限制、邮箱为空…），这时候邮箱里永远不会出现邮件。
+    旧版点完就直接让用户去查收码，用户只能干等——这就是「又没收到验证码」
+    的真正原因：请求压根没发出去，日志却什么都没说。
+
+    判据（按可靠性排序）：
+      1) 接口响应体 success=true / code=0
+      2) 按钮文字变成倒计时（「60s 后重发」）
+      3) 页面弹出「已发送」
+      4) 接口响应体里带明确失败信息 → 立刻判失败，并把原文报出来
+    """
+    detail = ""
+    prev_detail = ""
+    used_email = email_hint
+    for attempt in range(1, attempts + 1):
+        # 记录器要在点击之前就装好，否则抓不到这次请求的响应
+        _install_api_logger(page)
+        # 邮箱必须先填好——发码请求要带收件地址
+        filled_ok, actual_email = _fill_email_field(page, email_hint)
+        if not filled_ok:
+            return False, "邮箱输入框没能填上，发码请求没有收件地址", ""
+        if actual_email and actual_email != email_hint:
+            # 页面自己填的地址更可信（redirect 里可能没带 email 参数）
+            email_hint = actual_email
+        used_email = actual_email or email_hint
+
+        before = len(_api_log_window(page))
+
+        send_btn = None
+        for sel in ["button:has-text('发送验证码')", "button:has-text('发送')",
+                    "button:has-text('获取')"]:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    send_btn = loc
+                    break
+            except Exception:
+                continue
+        if send_btn is None:
+            detail = "页面上没找到「发送验证码」按钮"
+            _log(f"✗ {detail}")
+            return False, detail, used_email
+
+        # 坐标点击（locator.click() 在 Camoufox 下可能点到被遮挡/隐藏元素，
+        # 表现为「已点击」但实际没触发发信）
+        try:
+            box = send_btn.bounding_box()
+            if box:
+                x = box["x"] + box["width"] / 2
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y, steps=random.randint(5, 12))
+                page.wait_for_timeout(random.randint(100, 300))
+                page.mouse.down()
+                page.wait_for_timeout(random.randint(60, 140))
+                page.mouse.up()
+                _log("已点击「发送验证码」（坐标点击）")
+            else:
+                send_btn.click(timeout=5000)
+                _log("已点击「发送验证码」（locator 点击）")
+        except Exception as e:
+            _log(f"点击发送验证码失败：{type(e).__name__}")
+            continue
+
+        # 等服务器的回话（最多 20 秒）
+        deadline = time.time() + 20
+        verdict = None
+        while time.time() < deadline:
+            page.wait_for_timeout(800)
+            new = _api_log_window(page)[before:]
+            if new:
+                send_entries = [e for e in new if _is_send_api(e.get("url") or "")]
+                if send_entries:
+                    verdict = _judge_send_response(send_entries, strict=True)
+                else:
+                    # 来源不确定的接口：光一个 2xx 不算数，继续等更明确的信号
+                    verdict = _judge_send_response(new, strict=False)
+                if verdict is not None:
+                    break
+                for e in new[-3:]:
+                    _dbg(f"发码接口响应：{e.get('url')} status={e.get('status')} "
+                         f"body={str(e.get('body'))[:200]}")
+            btn_text = _send_btn_text(page)
+            if _is_countdown(btn_text):
+                verdict = (True, f"按钮已进入倒计时（{btn_text}）")
+                break
+            notice = _page_notice_text(page)
+            if notice:
+                if _looks_like_sent(notice):
+                    verdict = (True, f"页面提示：{notice}")
+                    break
+                if _looks_like_error(notice):
+                    verdict = (False, f"页面提示：{notice}")
+                    break
+
+        if verdict is None:
+            verdict = (False, "点了按钮，但 20 秒内没看到任何接口响应")
+        ok, detail = verdict
+        if ok:
+            _log(f"✓ 验证码已发出（{detail}）")
+            return True, detail, used_email
+        _log(f"✗ 第 {attempt}/{attempts} 次发码未成功：{detail}")
+        # 重试可能拿到更含糊的原因，别把已经说清楚的那条覆盖掉
+        if "没看到任何接口响应" in detail and prev_detail:
+            detail = prev_detail
+        prev_detail = detail
+        if attempt < attempts:
+            _log("重试：再等一次 Turnstile，然后重新点")
+            try:
+                _wait_turnstile(page, timeout=30, widget_only_ok=True)
+            except Exception:
+                pass
+    return False, detail or "发码失败", used_email
+
+
 def _handle_email_verify(page, redirect: str, username: str):
-    """处理密码登录后的邮箱验证码二次确认（手动输入验证码版）。
+    """处理密码登录后的邮箱验证码二次确认。
 
     NodeSeek 登录是两步：密码验证通过后，redirect 到 emailSignIn.html 要求
-    邮箱验证码。这里跳转到该页 → 点「发送验证码」→ 停在命令行等用户去邮箱
-    收码并输入 → 填入 Validation Code → 点登录 → 拿 sessionid。
+    邮箱验证码。这里跳转到该页 → 填邮箱 → 点「发送验证码」→ **确认邮件真的
+    发出去了** → 停在命令行等用户把码输进来 → 填入 Validation Code → 点登录。
+
+    为什么一定要确认发码成功（2026-10 踩坑）：
+      旧版点完按钮就直接让用户去邮箱查收。但发码请求可能被服务器拒
+      （Turnstile 没通过 / 频率限制 / 邮箱框是空的），这时候邮箱里根本不会有
+      邮件，用户只能对着空邮箱干等，日志却什么都没说。
+      现在改成：读接口的真实响应 + 按钮倒计时 + 页面提示，三者交叉判定；
+      判定失败会重试，全失败就明确报出原因，不再假装成功。
 
     之所以「停在命令行等输入」，是因为邮箱验证码是「一次性」的：完成后
     浏览器 profile 会被 NodeSeek 记住，之后同一 profile 密码登录就免验证，
@@ -954,90 +1275,46 @@ def _handle_email_verify(page, redirect: str, username: str):
     if has_ts:
         try:
             _log("等待邮箱验证页的 Turnstile 组件…")
-            _wait_turnstile(page, timeout=30)
-            _log("Turnstile 已就绪")
+            # widget_only_ok=True：callback 模式下 token 不落 hidden input，
+            # 组件显示通过就算通过，别再白等满 30 秒。
+            ts = _wait_turnstile(page, timeout=30, widget_only_ok=True)
+            # 老版本这里无条件打印「Turnstile 已就绪」——哪怕什么都没等到。
+            # 那样看日志的人会以为验证过了，其实发码请求很可能就是被它拒的。
+            if ts:
+                _log("Turnstile 已就绪")
+            else:
+                _log("⚠️ Turnstile 30 秒内没确认通过（发码请求可能被拒，会重试）")
         except Exception as e:
             _log(f"等待 Turnstile 出现异常（不阻塞，继续尝试发送）：{type(e).__name__}")
     else:
         _log("该页没有 Turnstile 组件，直接发码")
 
-    # 1b) 装 API 记录器：提交验证码后，服务器到底回什么（成功/验证码错误），
-    #     只有原文说了算——页面读 br 压缩响应体会失败，页面 JS 里读不会。
-    _install_api_logger(page)
-
-    # 2) 点「发送验证码」按钮，让 NodeSeek 向绑定邮箱发码
-    #    用坐标点击（和 Turnstile 复选框一样），因为 locator.click() 在 Camoufox
-    #    下可能点到被遮挡/隐藏元素，导致「已点击」但实际没触发发信。
-    send_btn = None
-    for sel in ["button:has-text('发送验证码')", "button:has-text('发送')", "button:has-text('获取')"]:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible():
-                send_btn = loc
-                break
-        except Exception:
-            continue
-    if send_btn is not None:
-        try:
-            box = send_btn.bounding_box()
-            _dbg(f"「发送验证码」按钮位置：{box}")
-            if box:
-                x = box["x"] + box["width"] / 2
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y, steps=random.randint(5, 12))
-                page.wait_for_timeout(random.randint(100, 300))
-                page.mouse.down()
-                page.wait_for_timeout(random.randint(60, 140))
-                page.mouse.up()
-                _log("已点击「发送验证码」（坐标点击）")
-            else:
-                send_btn.click(timeout=5000)
-                _log("已点击「发送验证码」（locator 点击）")
-        except Exception as e:
-            _log(f"点击发送验证码失败：{type(e).__name__}，请手动点一下")
+    # 2) 取绑定邮箱 + 真正把码发出去（并且确认发出去了）
+    #    redirect 形如 /emailSignIn.html?email=xxx%40yyy.com
+    email_hint = ""
+    m = re.search(r"[?&]email=([^&]+)", redirect or "")
+    if m:
+        email_hint = unquote(m.group(1)).strip()
+    if not email_hint:
+        # 拿不到就用登录名兜底（NodeSeek 允许邮箱登录）
+        email_hint = (username or "").strip()
+        if "@" not in email_hint:
+            email_hint = ""
+    if email_hint:
+        _log(f"绑定邮箱：{email_hint}")
     else:
-        _log("未找到「发送验证码」按钮，请确认页面已加载，手动点一下")
+        _log("⚠️ 没能从 redirect 里解析出绑定邮箱")
 
-    # 3) 验证发码是否真的成功：按钮文字通常会变成「60s 后重发」之类的倒计时
-    page.wait_for_timeout(3000)
-    try:
-        btn_text = page.evaluate(
-            """() => {
-                for (const b of document.querySelectorAll('button')) {
-                    const t = (b.innerText || '').trim();
-                    if (t && /发送|重发|秒|重新/.test(t)) return t;
-                }
-                return '';
-            }"""
-        )
-        _log(f"发送后按钮状态：{btn_text!r}（若显示倒计时说明发码成功）")
-    except Exception:
-        pass
-    # 读一下弹窗内容：发码成功/失败的提示都在弹窗里，比倒计时更直接
-    try:
-        dlg = page.evaluate(
-            """() => {
-                for (const sel of ['.msc-alert', '.modal.show', '[role="dialog"]', '.swal2-container']) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        const st = window.getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-                        const t = (el.innerText || '').trim();
-                        if (t) return t.slice(0, 300);
-                    }
-                }
-                return '';
-            }"""
-        )
-        if dlg:
-            _log(f"发码后弹窗内容：{dlg!r}")
-    except Exception:
-        pass
-    try:
-        _dump_form_structure(page)
-    except Exception:
-        pass
+    sent, send_detail, used_email = _send_email_code(page, email_hint)
+    if not sent:
+        _log(f"❌ 验证码没发出去：{send_detail}")
+        _log("   → 邮箱里不会有邮件，别去查收。")
+        _log("   → 常见原因：Turnstile 没通过 / 触发频率限制 / 邮箱地址不对。")
+        return None
+    if used_email:
+        email_hint = used_email
 
-    # 4) 取验证码（自动收码已配置则自动取，否则手动输入）
+    # 3) 取验证码（自动收码已配置则自动取，否则手动输入）
     _log("")
     _log("=" * 50)
     _log("  需要邮箱验证码（24 位字母数字串，如 8415f1a2b52331d5a2b9078e）")
@@ -1045,8 +1322,7 @@ def _handle_email_verify(page, redirect: str, username: str):
             or (os.getenv("NS_IMAP_HOST", "").strip() and os.getenv("NS_IMAP_USER", "").strip()):
         _log("  已配置自动收码，正在等待邮件…")
     else:
-        _log("  请到绑定邮箱查收验证码邮件，整段复制过来即可")
-        _log("  （想让这一步也自动化，见部署指南「让验证码也自动化」）")
+        _log(f"  验证码已发到 {email_hint}，请查收后整段复制过来即可")
     _log("=" * 50)
     code = _obtain_email_code()
     if not code:
@@ -1062,18 +1338,15 @@ def _handle_email_verify(page, redirect: str, username: str):
     # 5) 先关掉可能弹出的模态框（它会盖住输入框，导致 click 超时）
     _dismiss_dialog(page)
 
-    # 6) 显式填邮箱（emailSignIn 的 Email 框可能没被前端自动填充）
-    try:
-        email_hint = ""
-        m = re.search(r"email=([^&]+)", redirect or "")
-        if m:
-            email_hint = unquote(m.group(1))
-        if email_hint:
+    # 6) 邮箱在发码之前就填好了（见 _send_email_code）。
+    #    这里只做一次兜底：万一中途被页面清空了，补填回去。
+    if email_hint:
+        try:
             email_input = _first_visible(
                 page,
                 ["input[placeholder='Email']", 'input[placeholder*="Email"]',
                  'input[type="email"]', "input[name='email']"],
-                timeout=4000,
+                timeout=3000,
             )
             if email_input is not None:
                 cur_val = ""
@@ -1081,14 +1354,13 @@ def _handle_email_verify(page, redirect: str, username: str):
                     cur_val = email_input.input_value() or ""
                 except Exception:
                     pass
-                if not cur_val:
+                if not cur_val.strip():
                     if _fill_input_safe(email_input, email_hint, "邮箱框"):
-                        _log(f"已填入邮箱：{email_hint}")
-                        page.wait_for_timeout(300)
+                        _log(f"邮箱框被清空了，已补填：{email_hint}")
                 else:
                     _log(f"邮箱框已有值：{cur_val}")
-    except Exception as e:
-        _log(f"填邮箱异常（不阻塞）：{type(e).__name__}")
+        except Exception as e:
+            _log(f"检查邮箱框异常（不阻塞）：{type(e).__name__}")
 
     # 7) 填入 Validation Code 输入框
     code_input = _first_visible(
