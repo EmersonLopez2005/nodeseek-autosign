@@ -878,12 +878,13 @@ def process_site(site_name, site_config, ns_random):
     if site_config.get("count_cookie_files"):
         account_count = max(account_count, count_saved_cookie_files(site_name))
 
-    # 站点可以声明「什么都没配时，账号数跟随 NS 站」。
+    # 站点可以声明「账号数跟随 NS 站」。
     # DF 与 NS 是 1:1 绑定的（一键登录靠 NS 身份换 DF 登录态），
-    # 所以 NS 有几个账号，DF 就该跑几个——全程不需要配任何 DF 账号密码。
-    # 仅在**完全没有**自有账号来源时才回落，避免覆盖用户显式配置。
-    if account_count == 0 and site_config.get("count_follow_ns"):
-        account_count = count_ns_accounts()
+    # 所以 NS 有几个账号，DF 就该跑几个——没有 cookie 的那个会自动一键登录。
+    # 用 max 而不是「为空才回落」：否则只存了账号 1 的 cookie 时（文件数=1），
+    # 第 2 个 DF 账号会被静默漏掉。
+    if site_config.get("count_follow_ns"):
+        account_count = max(account_count, count_ns_accounts())
 
     if account_count == 0:
         print(f"未配置 {site_config.get('account_var')} / {site_config['cookie_var']}，跳过")

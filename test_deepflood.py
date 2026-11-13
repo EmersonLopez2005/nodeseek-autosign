@@ -294,7 +294,36 @@ try:
     chk("DF 全空时跟随 NS 账号数跑 2 个", out.count("--- 账号:"), 2)
     chk("DF 全空时触发 2 次一键登录", attempts["n"], 2)
 
-    # 5c：NS 的计数逻辑不受影响（nodeseek 没配 count_cookie_files）
+    # 5c：只存了账号 1 的 cookie，NS 有 2 个账号 → DF 仍要跑 2 个
+    #（第 2 个没有 cookie，走一键登录；不能因为文件数=1 就漏掉）
+    with open(os.path.join(_tmpdir, "DEEPFLOOD_COOKIE_1.txt"), "w", encoding="utf-8") as f:
+        f.write("session=dfonly")
+    os.environ["NS_USER_PASS"] = "ns_a&p1&ns_b&p2"
+    os.environ["DF_USER_PASS"] = ""
+    os.environ["DF_COOKIE"] = ""
+    attempts2 = {"n": 0}
+
+    def ok_df_login2(*a, **k):
+        attempts2["n"] += 1
+        return {"cookie": "session=dfok2", "cookie_life": "还剩 29 天"}
+
+    M.deepflood_login_detail = ok_df_login2
+    M.load_cookies_from_file = lambda site, idx=None: (
+        "session=dfonly" if (site == "deepflood" and idx == 1) else "")
+
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        M.process_site("deepflood", DF, "true")
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    chk("只有账号1的 cookie 时仍跑满 2 个账号", out.count("--- 账号:"), 2)
+    chk("缺 cookie 的那个走一键登录", attempts2["n"], 1)
+    os.remove(os.path.join(_tmpdir, "DEEPFLOOD_COOKIE_1.txt"))
+
+    # 5d：NS 的计数逻辑不受影响（nodeseek 没配 count_cookie_files）
     with open(os.path.join(_tmpdir, "NODESEEK_COOKIE_1.txt"), "w") as f:
         f.write("session=ns1")
     with open(os.path.join(_tmpdir, "NODESEEK_COOKIE_2.txt"), "w") as f:
