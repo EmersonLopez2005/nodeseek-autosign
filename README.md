@@ -251,6 +251,50 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 
 有 cookie 就先用 cookie，失效了才去登录。
 
+### DeepFlood（NodeSeek 的附属站）
+
+[deepflood.com](https://www.deepflood.com/) 是 NS 的附属站，**跑的是同一套程序**
+（同样的 Vue SSR、同样的 `msc-script`、连 `fog` 指纹服务都同一个），
+接口和返回结构完全一致，所以签到逻辑直接复用，只是换域名。
+
+配置只加一个 cookie，二选一：
+
+```bash
+# 方式 1：写文件（推荐，不用动 .env）
+#   内容就是浏览器里的 cookie 串
+echo 'session=xxx; cf_clearance=yyy' > cookie/DEEPFLOOD_COOKIE_1.txt
+
+# 方式 2：写进 .env
+DF_COOKIE=session=xxx; cf_clearance=yyy
+```
+
+cookie 怎么取：浏览器登录 deepflood.com → `F12` → Application（应用）→
+Cookies → `https://www.deepflood.com` → 把 **HttpOnly 的那些也要** 拼成
+`name=value; name2=value2`。
+
+多账号用 `&` 分隔，和 NS 一样。
+
+**和 NS 的三点差异：**
+
+| | NodeSeek | DeepFlood |
+|---|---|---|
+| 自动登录 | 支持（Camoufox 过 Turnstile + 邮箱验证码） | **不支持**（登录必须走 NodeSeek Connect 授权或邮箱密码 + 人机验证，cron 里做不到） |
+| 签到参数 | `NS_RANDOM` 控制「试试手气」 | 固定 `random=true` 走「试试手气」（实测 10~12 个；固定按钮只有 5 个） |
+| cookie 失效后 | 自动重新登录 | 推 Telegram 提醒你手动换 cookie |
+
+> **不影响 NS。** 这个站点是纯新增的配置项：NS 的配置、请求参数、判定文案
+> 一个字符都没动，两边 cookie 也分别存在 `NODESEEK_COOKIE_*.txt` /
+> `DEEPFLOOD_COOKIE_*.txt`，互不覆盖。没配 `DF_COOKIE` 时 DF 会被直接跳过，
+> NS 照常签到。
+
+想改成固定 5 个：把 `SITES_CONFIG` 里 `deepflood` 的 `"random"` 改成 `"false"`。
+
+回归测试（不需要联网）：
+
+```bash
+python test_deepflood.py
+```
+
 ---
 
 ## 五、主要配置项

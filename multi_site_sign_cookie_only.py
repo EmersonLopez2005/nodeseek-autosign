@@ -72,6 +72,45 @@ SITES_CONFIG = {
         "pass_var": "NS_PASS",
         "account_var": "NS_USER_PASS"
     },
+
+    # ------------------------------------------------------------------
+    # DeepFlood —— NodeSeek 的附属站，**同一套程序**（同样的 Vue SSR、
+    # 同样的 msc-script、连 fog 指纹服务都同一个），接口和返回结构完全一致。
+    # 所以这里只是换域名，逻辑复用 NS 那份。
+    #
+    # 与 NS 的两点差异（都已通过站点自己的前端 bundle 核实）：
+    #   1) 签到接口 /api/attendance?random=true|false
+    #        random=false → 按钮「鸡腿 x 5」（固定 5）
+    #        random=true  → 按钮「试试手气」（榜单实测 10~12）
+    #      所以 random 显式设 true，拿「试试手气」。
+    #   2) 登录走 NodeSeek Connect(OAuth) 或邮箱密码，**都要过人机验证**，
+    #      没法在 cron 里无人值守完成 → allow_auto_login=False，只认 Cookie。
+    #
+    # 这个条目是**纯新增**：NS 的配置和分支一个字符都没动。
+    # ------------------------------------------------------------------
+    "deepflood": {
+        "name": "DeepFlood",
+        "type": "deepflood",
+        "sign_api": "https://www.deepflood.com/api/attendance",
+        "stats_api": "https://www.deepflood.com/api/account/credit/page-",
+        "board_url": "https://www.deepflood.com/board",
+        "origin": "https://www.deepflood.com",
+        "cookie_var": "DF_COOKIE",
+        "login_url": "https://www.deepflood.com/signIn.html",
+        "user_var": "DF_USER",
+        "pass_var": "DF_PASS",
+        "account_var": "DF_USER_PASS",
+        # 拿「试试手气」，而不是固定的 5 个
+        "random": "true",
+        # 不尝试自动登录（DF 登录必须先过人机验证）
+        "allow_auto_login": False,
+        # 「今天已签过」的判定文案（比 NS 多几种写法，防止同义句漏判）
+        "already_keywords": ["已完成签到", "已经签到", "已签到", "重复签到"],
+        # 校验接口判「无效」时不直接放弃，仍然试一次签到。
+        # 原因：签到接口 /api/attendance 才是权威，校验走的 credit 接口
+        # 行为未经登录态验证过；万一它误判，不该让签到白白失败。
+        "lenient_cookie_check": True,
+    },
 }
 
 # === Refract 签名配置 ===
@@ -488,7 +527,11 @@ def sign(cookie, site_config, ns_random):
         time.sleep(random.uniform(2, 4))
 
         # 2. 签到 (POST)
-        url = f"{site_config['sign_api']}?random={ns_random}"
+        # 每站可覆盖 random 参数：
+        #   NS 没配 "random" → 仍然用环境变量 NS_RANDOM（默认 true），行为不变
+        #   DeepFlood 配了 true → 走「试试手气」
+        site_random = site_config.get("random", ns_random)
+        url = f"{site_config['sign_api']}?random={site_random}"
         headers = {
             'Origin': site_config["origin"],
             'Referer': site_config["board_url"],
@@ -507,6 +550,13 @@ def sign(cookie, site_config, ns_random):
             return "fail", f"未知响应 (Code {resp.status_code})"
 
         msg = data.get("message", "")
+        # 「今天已签过」优先判定 —— 但**只有站点显式配了 already_keywords 才启用**。
+        # NS 没配 → 这段跳过 → 下面的判定顺序和改动前逐字一致。
+        # 为什么需要：已签过的响应有时 success=false 但文案里带「鸡腿」，
+        # 会被当成 success，导致重复推送「签到成功」。
+        already_kw = site_config.get("already_keywords")
+        if already_kw and any(k in msg for k in already_kw):
+            return "already", msg
         if "鸡腿" in msg or data.get("success"): return "success", msg
         elif "已完成签到" in msg: return "already", msg
         elif data.get("status") == 404: return "invalid", msg
@@ -686,6 +736,10 @@ def process_site(site_name, site_config, ns_random):
         renew_threshold = float(os.getenv("NS_RENEW_BEFORE_DAYS", "5") or 5)
         device_memory_expired = False
         email_verify_used = False
+        # 该站点要不要尝试「自动登录」。
+        # NS 不配这个键 → 默认 True，跟改动前完全一致。
+        # DeepFlood 配了 False（它登录必须先过人机验证，cron 里做不到）。
+        allow_auto_login = site_config.get("allow_auto_login", True)
 
         # ---- 主动续期 ----
         # NodeSeek 的登录 cookie 约 30 天过期。等它掉了才重登，很可能撞上
@@ -693,7 +747,7 @@ def process_site(site_name, site_config, ns_random):
         # 所以：剩余寿命不足阈值时，提前主动换新一次。
         # 换新用的还是同一个持久化 profile，NodeSeek 记得这台设备，
         # 所以这一步不需要邮箱验证码。
-        if cookie and meta:
+        if cookie and meta and allow_auto_login:
             days = cookie_days_left(meta)
             if days is not None:
                 print(f"Cookie 剩余寿命：{days:.1f} 天")
@@ -714,16 +768,24 @@ def process_site(site_name, site_config, ns_random):
         if cookie:
             check_result = check_cookie_validity(site_config, cookie)
             if check_result is False:
-                print("Cookie已确认失效，尝试恢复登录...")
-                cookie = None
+                if site_config.get("lenient_cookie_check"):
+                    # 校验说不无效，但签到接口才是权威 —— 继续试，
+                    # 真无效的话签到那一步自然会失败。
+                    print("Cookie校验未通过，但该站点允许继续尝试签到")
+                else:
+                    print("Cookie已确认失效，尝试恢复登录...")
+                    cookie = None
             elif check_result is None:
                 print("Cookie状态不确定，继续尝试使用现有Cookie签到")
             else:
                 print("Cookie有效")
         else:
-            print("无可用Cookie，尝试登录...")
+            if allow_auto_login:
+                print("无可用Cookie，尝试登录...")
+            else:
+                print("无可用Cookie（该站点未开启自动登录，需要手动配置 Cookie）")
 
-        if not cookie:
+        if not cookie and allow_auto_login:
             cookie, meta = recover_cookie(site_name, site_config, idx, user, pwd)
             device_memory_expired = bool(meta.get("device_memory_expired"))
             email_verify_used = bool(meta.get("needs_email_verify"))
@@ -734,6 +796,10 @@ def process_site(site_name, site_config, ns_random):
             if device_memory_expired:
                 msg = ("登录失败：NodeSeek「记住设备」疑似已失效，"
                        "这次仍要求邮箱验证码。请手动跑一次登录完成验证")
+            elif not allow_auto_login:
+                msg = ("没有可用的 Cookie。这个站点没开自动登录，"
+                       f"需要手动填 {site_config['cookie_var']}"
+                       f"（或写进 cookie/{site_name.upper()}_COOKIE_1.txt）")
             site_results.append({
                 'user': user,
                 'status': 'fail',
@@ -746,7 +812,7 @@ def process_site(site_name, site_config, ns_random):
         status, msg = sign(cookie, site_config, ns_random)
         print(f"签到结果: {msg}")
 
-        if sign_failure_should_recover(status, msg):
+        if sign_failure_should_recover(status, msg) and allow_auto_login:
             print("签到失败疑似Cookie不可用，尝试恢复登录后重试一次...")
             new_cookie, new_meta = recover_cookie(site_name, site_config, idx, user, pwd)
             if new_cookie:
