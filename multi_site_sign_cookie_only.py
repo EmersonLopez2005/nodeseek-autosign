@@ -124,6 +124,12 @@ SITES_CONFIG = {
         # 原因：签到接口 /api/attendance 才是权威，校验走的 credit 接口
         # 行为未经登录态验证过；万一它误判，不该让签到白白失败。
         "lenient_cookie_check": True,
+        # 账号数怎么算：
+        #   count_cookie_files —— cookie/DEEPFLOOD_COOKIE_n.txt 里有一个算一个
+        #   count_follow_ns    —— 什么都没配时，按 NS 的账号数跑（两边 1:1 绑定）
+        # 两者都只在 DF 开启；NS 没有这两个键 → 计数逻辑与改动前逐字一致。
+        "count_cookie_files": True,
+        "count_follow_ns": True,
     },
 }
 
@@ -203,6 +209,36 @@ def get_cookie_file_path(site_name, account_index=None):
     else:
         name = f"{site_name.upper()}_COOKIE.txt"
     return os.path.join(_COOKIE_DIR, name)
+
+
+def count_saved_cookie_files(site_name):
+    """数 cookie/<SITE>_COOKIE_<n>.txt 有几个非空文件。
+
+    为什么需要：process_site 以前的账号数只从环境变量算，
+    所以「cookie 文件存在但环境变量没配」会被判定为 0 个账号 → 整站跳过。
+    DeepFlood 的 cookie 是由一键登录**写进文件**的（df_probe --save），
+    不修这块，存下来的 cookie 永远进不了签到流程。
+    """
+    import glob
+    pat = os.path.join(_COOKIE_DIR, f"{site_name.upper()}_COOKIE_*.txt")
+    n = 0
+    for p in glob.glob(pat):
+        try:
+            if os.path.getsize(p) > 0:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def count_ns_accounts():
+    """算出 NodeSeek 侧一共有几个账号（账号密码 / 环境变量 cookie / cookie 文件 取最大）。"""
+    ns = SITES_CONFIG.get("nodeseek") or {}
+    n = len(get_accounts(ns))
+    env_cookies = split_env_items(os.getenv(ns.get("cookie_var", ""), ""))
+    n = max(n, len([c for c in env_cookies if "=" in c]))
+    n = max(n, count_saved_cookie_files("nodeseek"))
+    return n
 
 
 def load_cookies_from_file(site_name, account_index=None):
@@ -667,7 +703,20 @@ def _resolve_ns_account(site_config, account_index, df_user):
         idx = account_index - 1
         if len(items) > idx >= 0:
             return items[idx]
-    return (df_user or "").strip()
+
+    # 没配 DF_NS_ACCOUNT 时的回落顺序：
+    #   1) DF 用户名本身（DF / NS 同名的常见情况）
+    #   2) NS 站的第 N 个账号 —— DF 与 NS 1:1 绑定，直接对上最省事
+    # 注意要排除 process_site 生成的占位符「账号1/账号2」，否则会拿它去查
+    # cookie/profiles/账号1 这种不存在的目录。
+    df_name = (df_user or "").strip()
+    if df_name and not re.fullmatch(r"账号\d+", df_name):
+        return df_name
+
+    ns_accounts = get_accounts(SITES_CONFIG.get("nodeseek") or {})
+    if len(ns_accounts) >= account_index:
+        return (ns_accounts[account_index - 1].get("user") or "").strip()
+    return df_name
 
 
 def _recover_deepflood(site_name, site_config, account_index, user, pwd):
@@ -821,6 +870,20 @@ def process_site(site_name, site_config, ns_random):
     accounts = get_accounts(site_config)
     env_cookies = split_env_items(os.getenv(site_config["cookie_var"], ""))
     account_count = max(len(accounts), len([c for c in env_cookies if "=" in c]))
+
+    # 站点可以声明「cookie 文件也算一个账号」。
+    # NS 不配这个键 → 行为与改动前完全一致。
+    # DF 配 True：它的 cookie 是一键登录写进 cookie/DEEPFLOOD_COOKIE_n.txt 的，
+    # 不数文件的话，存下来的 cookie 会被判成「0 个账号 → 整站跳过」。
+    if site_config.get("count_cookie_files"):
+        account_count = max(account_count, count_saved_cookie_files(site_name))
+
+    # 站点可以声明「什么都没配时，账号数跟随 NS 站」。
+    # DF 与 NS 是 1:1 绑定的（一键登录靠 NS 身份换 DF 登录态），
+    # 所以 NS 有几个账号，DF 就该跑几个——全程不需要配任何 DF 账号密码。
+    # 仅在**完全没有**自有账号来源时才回落，避免覆盖用户显式配置。
+    if account_count == 0 and site_config.get("count_follow_ns"):
+        account_count = count_ns_accounts()
 
     if account_count == 0:
         print(f"未配置 {site_config.get('account_var')} / {site_config['cookie_var']}，跳过")

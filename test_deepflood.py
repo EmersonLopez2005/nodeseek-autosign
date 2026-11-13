@@ -230,5 +230,96 @@ out = buf.getvalue()
 chk("DF 无 cookie 时会尝试一键登录", login_attempts["df"], 1)
 chk("DF 失败原因写进告警文案", "NS 没登录" in out, True)
 
+print("\n=== 5. 账号数计数（cookie 文件 / 跟随 NS / NS 不受影响）===")
+
+import tempfile
+
+# 隔离出一个空 cookie 目录，避免读到本机真实的 cookie 文件
+_tmpdir = tempfile.mkdtemp(prefix="dfcnt_")
+_old_cookie_dir = M._COOKIE_DIR
+M._COOKIE_DIR = _tmpdir
+
+_real_sign = M.sign
+M.sign = lambda *a, **k: ("success", "今天签到成功")
+M.check_cookie_validity = lambda *a, **k: True
+M.send = lambda *a, **k: None
+M.NOTIFICATION_FILE = os.devnull
+
+try:
+    # 5a：只有 cookie 文件，没有 DF_USER_PASS / DF_COOKIE → 以前会被判 0 个账号跳过
+    with open(os.path.join(_tmpdir, "DEEPFLOOD_COOKIE_1.txt"), "w", encoding="utf-8") as f:
+        f.write("session=dfonly; pjwt=x")
+    chk("count_saved_cookie_files 能数到 DF cookie 文件",
+        M.count_saved_cookie_files("deepflood"), 1)
+
+    os.environ["DF_USER_PASS"] = ""
+    os.environ["DF_COOKIE"] = ""
+    os.environ["DF_NS_ACCOUNT"] = "账号A"
+    M.load_cookies_from_file = lambda site, idx=None: (
+        "session=dfonly; pjwt=x" if site == "deepflood" else "")
+
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        M.process_site("deepflood", DF, "true")
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    chk("只有 cookie 文件时不再整站跳过", "跳过" in out, False)
+    chk("只有 cookie 文件时确实跑了 1 个账号", out.count("--- 账号:"), 1)
+
+    # 5b：DF 什么都没配 → 账号数跟随 NS（NS 配 2 个账号）
+    os.remove(os.path.join(_tmpdir, "DEEPFLOOD_COOKIE_1.txt"))
+    os.environ["NS_USER_PASS"] = "ns_a&p1&ns_b&p2"
+    chk("NS 账号数算出来是 2", M.count_ns_accounts(), 2)
+
+    attempts = {"n": 0}
+
+    def ok_df_login(*a, **k):
+        attempts["n"] += 1
+        return {"cookie": "session=dfok", "cookie_life": "还剩 29 天"}
+
+    M.deepflood_login_detail = ok_df_login
+    M.load_cookies_from_file = lambda site, idx=None: ""
+
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        M.process_site("deepflood", DF, "true")
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    chk("DF 全空时跟随 NS 账号数跑 2 个", out.count("--- 账号:"), 2)
+    chk("DF 全空时触发 2 次一键登录", attempts["n"], 2)
+
+    # 5c：NS 的计数逻辑不受影响（nodeseek 没配 count_cookie_files）
+    with open(os.path.join(_tmpdir, "NODESEEK_COOKIE_1.txt"), "w") as f:
+        f.write("session=ns1")
+    with open(os.path.join(_tmpdir, "NODESEEK_COOKIE_2.txt"), "w") as f:
+        f.write("session=ns2")
+    chk("NS 配置里没有 count_cookie_files", NS.get("count_cookie_files"), None)
+    chk("NS 配置里没有 count_follow_ns", NS.get("count_follow_ns"), None)
+
+    os.environ["NS_USER_PASS"] = "ns_a&p1"          # 只配 1 个账号
+    os.environ["NS_COOKIE"] = "session=ns1; pjwt=x"
+    M.load_cookies_from_file = lambda site, idx=None: (
+        "session=ns1; pjwt=x" if site == "nodeseek" else "")
+
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        M.process_site("nodeseek", NS, "true")
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    chk("NS 仍只跑 1 个账号（cookie 文件不参与计数）", out.count("--- 账号:"), 1)
+finally:
+    M._COOKIE_DIR = _old_cookie_dir
+    M.sign = _real_sign
+    M.load_cookies_from_file = M.load_cookies_from_file_orig
+
 print(f"\n===== 结果：{PASS} 通过 / {FAIL} 失败 =====")
 sys.exit(1 if FAIL else 0)
