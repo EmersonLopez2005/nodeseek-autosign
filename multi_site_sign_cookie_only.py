@@ -26,7 +26,10 @@ except ImportError:
 
 # Playwright 浏览器登录
 try:
-    from browser_login import browser_login, browser_login_detail, browser_sign, PLAYWRIGHT_AVAILABLE
+    from browser_login import (
+        browser_login, browser_login_detail, browser_sign,
+        deepflood_login_detail, PLAYWRIGHT_AVAILABLE,
+    )
     if PLAYWRIGHT_AVAILABLE:
         print("成功加载 Playwright 浏览器登录模块")
 except ImportError:
@@ -34,6 +37,7 @@ except ImportError:
     browser_login = None
     browser_login_detail = None
     browser_sign = None
+    deepflood_login_detail = None
 
 # 环境变量（显式指向脚本同目录的 .env，避免 cwd 不同读不到）
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -83,8 +87,14 @@ SITES_CONFIG = {
     #        random=false → 按钮「鸡腿 x 5」（固定 5）
     #        random=true  → 按钮「试试手气」（榜单实测 10~12）
     #      所以 random 显式设 true，拿「试试手气」。
-    #   2) 登录走 NodeSeek Connect(OAuth) 或邮箱密码，**都要过人机验证**，
-    #      没法在 cron 里无人值守完成 → allow_auto_login=False，只认 Cookie。
+    #   2) 登录是「NodeSeek 一键登录」(NodeSeek Connect/OAuth)。
+    #      流程（从 DF nsSignIn 组件 + NS connect 组件里读出来的）：
+    #        DF 点「NodeSeek一键登录」
+    #          → window.open("nodeseek.com/connect?target=DeepFlood")
+    #            → NS 用**自己的登录态**调 /api/cAuth 换出 {data,wtf,sign}
+    #              → postMessage 回 DF → DF POST /api/account/nodeseek-signIn
+    #      所以一键登录**必须复用该 NS 账号的浏览器 profile**，不能另起一个。
+    #      ns_account_var 指向「按 DF 账号顺序对应的 NS 账号名」。
     #
     # 这个条目是**纯新增**：NS 的配置和分支一个字符都没动。
     # ------------------------------------------------------------------
@@ -100,10 +110,14 @@ SITES_CONFIG = {
         "user_var": "DF_USER",
         "pass_var": "DF_PASS",
         "account_var": "DF_USER_PASS",
+        # 用哪个 NS 账号的浏览器 profile 做一键登录（多账号用 & 分隔，按顺序对应）
+        "ns_account_var": "DF_NS_ACCOUNT",
+        # 登录方式：ns_connect = 一键登录(首选) → 失败回落密码
+        "login_mode": "ns_connect",
         # 拿「试试手气」，而不是固定的 5 个
         "random": "true",
-        # 不尝试自动登录（DF 登录必须先过人机验证）
-        "allow_auto_login": False,
+        # 允许自动登录（复用 NS profile 点一键登录；配了 DF_USER/DF_PASS 还能密码兜底）
+        "allow_auto_login": True,
         # 「今天已签过」的判定文案（比 NS 多几种写法，防止同义句漏判）
         "already_keywords": ["已完成签到", "已经签到", "已签到", "重复签到"],
         # 校验接口判「无效」时不直接放弃，仍然试一次签到。
@@ -628,6 +642,92 @@ def load_account_cookie(site_name, site_config, account_index):
     return get_env_cookie(site_config, account_index) or load_cookies_from_file(site_name, account_index)
 
 
+def _resolve_ns_account(site_config, account_index, df_user):
+    """算出「第 N 个 DF 账号」该用哪个 NS 账号的浏览器 profile。
+
+    DF 的一键登录靠 NS 的 /api/cAuth 用 NS 登录态换身份，所以必须打开
+    那个 NS 账号的 profile（cookie/profiles/<NS用户名>）。
+
+    多账号配置（按 DF 账号顺序对应，`&` 或 `,` 分隔）：
+        DF_NS_ACCOUNT=账号A&账号B
+    没配就跟 DF 用户名同名（DF/NS 同名的常见情况）。
+
+    注意 .env 里建议加引号：DF_NS_ACCOUNT="a&b"（dotenv 会原样读，
+    但直接 export 时 & 在 shell 里有特殊含义）。
+    """
+    var = site_config.get("ns_account_var")
+    raw = (os.getenv(var, "") if var else "").strip()
+    if raw:
+        items = [x.strip() for x in raw.replace("&", ",").split(",") if x.strip()]
+        # 只配了一个 → 所有 DF 账号都用它（单 NS 账号绑多个 DF 号的情况）
+        if len(items) == 1:
+            return items[0]
+        # account_index 是 1-based（and 由 process_site 从 1 开始传），
+        # 列表是 0-based —— 这里踩过坑，别写成 items[account_index]
+        idx = account_index - 1
+        if len(items) > idx >= 0:
+            return items[idx]
+    return (df_user or "").strip()
+
+
+def _recover_deepflood(site_name, site_config, account_index, user, pwd):
+    """DeepFlood 专属恢复登录：一键登录（复用 NS profile）→ 密码兜底。
+
+    返回 (cookie, meta)，与 recover_cookie 的约定一致。
+    失败时 meta["login_error"] 带上具体原因，供上层生成准确告警。
+    """
+    meta = {}
+    if not (PLAYWRIGHT_AVAILABLE and deepflood_login_detail):
+        meta["login_error"] = "没有可用的浏览器引擎（需要 camoufox / playwright）"
+        return None, meta
+
+    ns_account = _resolve_ns_account(site_config, account_index, user)
+    if not ns_account:
+        meta["login_error"] = (
+            "无法确定该用哪个 NS 账号的 profile —— 请配置 "
+            f"{site_config.get('ns_account_var', 'DF_NS_ACCOUNT')}（按 DF 账号顺序）"
+        )
+        print(f"✗ {meta['login_error']}")
+        return None, meta
+
+    print(f"尝试 DeepFlood 登录（复用 NS 账号「{ns_account}」的浏览器 profile）...")
+
+    # 把这个 NS 账号已保存的 cookie 一起带过去，注入浏览器当一键登录的身份。
+    # 必要性：profile 目录名由 _safe(用户名) 生成，纯中文账号会被压成 "account"
+    # （多账号直接撞同一个目录），而且 cookie 30 天就到期 —— profile 里那份
+    # 登录态经常已经不可用。注入 cookie 比指望 profile 可靠得多。
+    ns_cookie = load_cookies_from_file("nodeseek", account_index)
+    if ns_cookie:
+        print(f"  带上 NS 账号「{ns_account}」的 cookie 用于一键登录授权")
+    else:
+        print(f"  ⚠ 没找到 NS 账号 {account_index} 的 cookie（NODESEEK_COOKIE_{account_index}.txt），"
+              "只能依赖 profile 里现存的登录态")
+
+    r = deepflood_login_detail(site_config, user, pwd, ns_account=ns_account, ns_cookie=ns_cookie)
+    cookie = (r or {}).get("cookie")
+    if cookie:
+        save_cookie_to_file(site_name, cookie, account_index)
+        meta = {
+            "ts": time.time(),
+            "expiry": r.get("expiry"),
+            "cookie_life": r.get("cookie_life"),
+            "device_memory_expired": False,
+            "device_logged_in": True,
+            "needs_email_verify": False,
+            "login_mode": "ns_connect",
+            "profile_account": ns_account,
+        }
+        save_cookie_meta(site_name, account_index, meta)
+        return cookie, meta
+
+    err = (r or {}).get("error") or "LOGIN_FAILED"
+    msg = (r or {}).get("message") or ""
+    meta["login_error"] = f"[{err}] {msg}".strip()
+    meta["profile_account"] = ns_account
+    print(f"DeepFlood 登录未成功：{meta['login_error']}")
+    return None, meta
+
+
 def recover_cookie(site_name, site_config, account_index, user, pwd):
     """恢复登录。默认只用浏览器（本机或家宽 agent）。
 
@@ -653,6 +753,11 @@ def recover_cookie(site_name, site_config, account_index, user, pwd):
     # 结果每个新机器第一次登录都误报「设备记忆失效」。
     prev_meta = load_cookie_meta(site_name, account_index) or {}
     prior_logged_in = bool(prev_meta.get("device_logged_in"))
+
+    # DeepFlood 走「NodeSeek 一键登录」，需要复用该 NS 账号的浏览器 profile。
+    # 单独一个分支：NS 的既有路径（下面那个 browser_login_detail 调用）完全不受影响。
+    if site_config.get("login_mode") == "ns_connect":
+        return _recover_deepflood(site_name, site_config, account_index, user, pwd)
 
     if PLAYWRIGHT_AVAILABLE and browser_login_detail:
         print("尝试浏览器登录（本地 / 家宽 agent）...")
@@ -738,7 +843,8 @@ def process_site(site_name, site_config, ns_random):
         email_verify_used = False
         # 该站点要不要尝试「自动登录」。
         # NS 不配这个键 → 默认 True，跟改动前完全一致。
-        # DeepFlood 配了 False（它登录必须先过人机验证，cron 里做不到）。
+        # DeepFlood 也是 True，但走的是 login_mode=ns_connect 那条分支
+        # （复用该 NS 账号的 profile 点「NodeSeek 一键登录」）。
         allow_auto_login = site_config.get("allow_auto_login", True)
 
         # ---- 主动续期 ----
@@ -800,6 +906,10 @@ def process_site(site_name, site_config, ns_random):
                 msg = ("没有可用的 Cookie。这个站点没开自动登录，"
                        f"需要手动填 {site_config['cookie_var']}"
                        f"（或写进 cookie/{site_name.upper()}_COOKIE_1.txt）")
+            elif meta.get("login_error"):
+                # DF 之类的站会把具体失败原因（NS 登录态失效 / 没绑 DF 等）带出来，
+                # 直接转进告警，别让用户只看到「登录失败」四个字
+                msg = f"登录失败：{meta['login_error']}"
             site_results.append({
                 'user': user,
                 'status': 'fail',

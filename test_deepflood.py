@@ -136,23 +136,87 @@ case7 = FakeSession({"success": False, "message": "USER NOT FOUND", "status": 40
 M.create_session = lambda c=None: case7
 chk("DF cookie 失效 → invalid", M.sign("k=v", DF, "true")[0], "invalid")
 
-# ---------------- 不自动登录 ----------------
-print("\n=== 3. DF 不触发 NS 的浏览器登录 ===")
+# ---------------- 登录分流 ----------------
+print("\n=== 3. 登录分流：DF 走一键登录（复用 NS profile），NS 走原路径 ===")
 
-called = {"recover": 0, "validity": 0}
-M.recover_cookie = lambda *a, **k: (called.__setitem__("recover", called["recover"] + 1), (None, {}))[1]
-M.check_cookie_validity = lambda *a, **k: (called.__setitem__("validity", called["validity"] + 1), True)[1]
+calls = {"df": [], "ns": []}
+M.PLAYWRIGHT_AVAILABLE = True
 
-# 造一个「配了账号密码、但没有 cookie」的场景：
-# account_count 才会是 1，流程才会走到「没 cookie → 要不要自动登录」这一步。
+
+def fake_df_login(site_config, user, pwd, ns_account=None, ns_cookie="", headless=None, **kw):
+    calls["df"].append((user, ns_account))
+    calls.setdefault("ns_cookies", []).append(ns_cookie)
+    return {"cookie": "session=dfok", "cookie_life": "还剩 29 天",
+            "profile_account": ns_account}
+
+
+def fake_ns_login(site_config, user, pwd, headless=True):
+    calls["ns"].append(user)
+    return {"cookie": "session=nsok", "cookie_life": "还剩 29 天",
+            "device_memory_expired": False, "needs_email_verify": False}
+
+
+M.deepflood_login_detail = fake_df_login
+M.browser_login_detail = fake_ns_login
+M.save_cookie_to_file = lambda *a, **k: None
+M.save_cookie_meta = lambda *a, **k: None
+M.load_cookie_meta = lambda *a, **k: {}
+
+# 多账号：DF 第 1/2 个账号分别对应 NS 的两个账号
+os.environ["DF_NS_ACCOUNT"] = "账号A&账号B"
+c1, m1 = M.recover_cookie("deepflood", DF, 1, "df_a", "p")
+c2, m2 = M.recover_cookie("deepflood", DF, 2, "df_b", "p")
+chk("DF 账号1 → NS profile「账号A」", calls["df"][0][1], "账号A")
+chk("DF 账号2 → NS profile「账号B」", calls["df"][1][1], "账号B")
+chk("DF 账号1 拿到 cookie", c1, "session=dfok")
+chk("DF 账号2 拿到 cookie", c2, "session=dfok")
+chk("DF 没走 NS 的登录路径", len(calls["ns"]), 0)
+
+# 没配 DF_NS_ACCOUNT → 默认用 DF 用户名当 profile 名
+os.environ.pop("DF_NS_ACCOUNT", None)
+M.recover_cookie("deepflood", DF, 1, "same_name", "p")
+chk("未配 DF_NS_ACCOUNT 时回落到 DF 用户名", calls["df"][-1][1], "same_name")
+
+# 只配一个 NS 账号 → 所有 DF 账号都用它
+os.environ["DF_NS_ACCOUNT"] = "only_ns"
+M.recover_cookie("deepflood", DF, 2, "df_c", "p")
+chk("只配一个 NS 账号时全部复用", calls["df"][-1][1], "only_ns")
+
+# NS 一个字节都没受影响
+c3, _ = M.recover_cookie("nodeseek", NS, 1, "ns_user", "p")
+chk("NS 仍走 browser_login_detail", len(calls["ns"]), 1)
+chk("NS 没走 DF 的登录", len(calls["df"]), 4)
+chk("NS 配置里没有 login_mode", NS.get("login_mode"), None)
+chk("NS 配置里没有 ns_account_var", NS.get("ns_account_var"), None)
+
+# DF 登录失败时，原因要能传出到告警
+def failing_df_login(*a, **k):
+    return {"error": "NS_NOT_LOGGED_IN", "message": "这个 profile 里 NodeSeek 没登录"}
+
+
+M.deepflood_login_detail = failing_df_login
+cbad, mbad = M.recover_cookie("deepflood", DF, 1, "df_a", "p")
+chk("DF 失败时 cookie 为 None", cbad, None)
+chk("DF 失败原因带 error 码", "NS_NOT_LOGGED_IN" in (mbad.get("login_error") or ""), True)
+
+print("\n=== 4. process_site 端到端（DF 无 cookie → 触发一键登录）===")
+
+login_attempts = {"df": 0}
+
+
+def counting_df_login(*a, **k):
+    login_attempts["df"] += 1
+    return {"cookie": "", "error": "NS_NOT_LOGGED_IN", "message": "NS 没登录"}
+
+
+M.deepflood_login_detail = counting_df_login
 os.environ["DF_USER_PASS"] = "df_user&df_pass"
-os.environ["NS_USER_PASS"] = "ns_user&ns_pass"
 os.environ["DF_COOKIE"] = ""
-os.environ["NS_COOKIE"] = ""
 M.load_cookies_from_file_orig = M.load_cookies_from_file
 M.load_cookies_from_file = lambda *a, **k: ""
 M.send = lambda *a, **k: None
 M.NOTIFICATION_FILE = os.devnull
+
 try:
     buf = io.StringIO()
     old = sys.stdout
@@ -163,20 +227,8 @@ finally:
     M.load_cookies_from_file = M.load_cookies_from_file_orig
 
 out = buf.getvalue()
-chk("DF 无 cookie 时不调用 recover_cookie", called["recover"], 0)
-chk("DF 给出明确提示（未开启自动登录）", "未开启自动登录" in out, True)
-
-# NS 仍会调用 recover_cookie（证明 NS 那条路没被削弱）
-called["recover"] = 0
-M.load_cookies_from_file = lambda *a, **k: ""
-buf2 = io.StringIO()
-old = sys.stdout
-sys.stdout = buf2
-try:
-    M.process_site("nodeseek", NS, "true")
-finally:
-    sys.stdout = old
-chk("NS 无 cookie 时仍会尝试自动登录（行为未削弱）", called["recover"] >= 1, True)
+chk("DF 无 cookie 时会尝试一键登录", login_attempts["df"], 1)
+chk("DF 失败原因写进告警文案", "NS 没登录" in out, True)
 
 print(f"\n===== 结果：{PASS} 通过 / {FAIL} 失败 =====")
 sys.exit(1 if FAIL else 0)

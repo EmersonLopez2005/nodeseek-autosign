@@ -216,6 +216,87 @@ def browser_login_detail(site_config, user, pwd, headless=True):
     return {"error": "LOGIN_FAILED", "message": " | ".join(errors)}
 
 
+def deepflood_login_detail(site_config, user, pwd, ns_account=None, ns_cookie="", headless=None):
+    """DeepFlood 登录：NodeSeek 一键登录（复用 NS 的 profile）→ 密码兜底。
+
+    和 browser_login_detail 的两个关键区别：
+
+    1) **profile 目录按 ns_account 选，不是 user**。
+       DF 的一键登录靠 NS 的 /api/cAuth 用 NS 登录态换身份，
+       所以必须打开「那个 NS 账号」的 profile（cookie/profiles/<NS用户名>）。
+       传 user 会另起一个干净 profile，里面没有 NS 登录态，一键登录必然失败。
+
+    2) **不走远程 agent**。
+       远程 agent 的 profile 在另一台机器上，和 NS 登录用的不是同一份，
+       发过去也拿不到 NS 登录态。DF 只在本机浏览器里做。
+
+    参数 ns_cookie：该 NS 账号已保存的 cookie。会注入浏览器当作一键登录的身份，
+    这样 profile 里没留登录态（或纯中文账号撞了 profile 目录）也能授权成功。
+
+    返回结构与 browser_login_detail 保持一致，方便上层统一处理。
+    """
+    profile_account = (ns_account or "").strip() or (user or "").strip()
+    if not profile_account:
+        return {
+            "error": "MISSING_PROFILE_ACCOUNT",
+            "message": "没有可用的 NS 账号名，无法定位含 NS 登录态的 profile",
+        }
+
+    # 本地模式默认有头（无头过不了 Cloudflare），与 NS 登录保持一致
+    _lh = os.getenv("LOGIN_LOCAL_HEADLESS")
+    if _lh is None:
+        headless = False
+    else:
+        headless = _lh.strip().lower() in ("1", "true", "yes")
+
+    site = site_config.get("type", "deepflood")
+    try:
+        import deepflood_login
+        from browser_engine import browser_page
+
+        profile = os.path.join(_HERE, "cookie", "profiles", _safe(profile_account))
+        print(f"[deepflood] 使用 NS 账号「{profile_account}」的 profile 登录"
+              f"（{profile}）")
+
+        # 一键登录开关：DF_NS_CONNECT=false 可强制只走密码
+        try_ns_connect = os.getenv("DF_NS_CONNECT", "true").strip().lower() in ("1", "true", "yes")
+        allow_password = bool(user and pwd)
+
+        with browser_page(
+            engine=os.getenv("AGENT_ENGINE", "auto"),
+            headless=headless,
+            user_data_dir=profile,
+            proxy=os.getenv("AGENT_PROXY", ""),
+        ) as page:
+            r = deepflood_login.login(
+                page, user, pwd,
+                try_ns_connect=try_ns_connect,
+                allow_password=allow_password,
+                ns_cookie=ns_cookie or "",
+            )
+    except Exception as e:
+        code = getattr(e, "code", type(e).__name__)
+        msg = getattr(e, "message", str(e))
+        print(f"[deepflood] 登录异常 [{code}] {msg}")
+        return {"error": code, "message": msg}
+
+    if r.get("cookie"):
+        print(f"[deepflood] 登录成功  有效期={r.get('cookie_life', '?')}")
+        return {
+            "cookie": r["cookie"],
+            "expiry": r.get("expiry"),
+            "cookie_life": r.get("cookie_life"),
+            "device_memory_expired": False,
+            "needs_email_verify": False,
+            "profile_account": profile_account,
+        }
+
+    code = r.get("error") or "LOGIN_FAILED"
+    msg = r.get("message") or ""
+    print(f"[deepflood] 登录失败 [{code}] {msg}")
+    return {"error": code, "message": msg, "profile_account": profile_account}
+
+
 def browser_sign(site_config, cookie=None):
     """可选：整段签到交给 agent 在浏览器里做。返回 agent 的原始结果 dict。"""
     for base in _pick_agent("sign"):

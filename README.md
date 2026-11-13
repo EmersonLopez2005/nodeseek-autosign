@@ -257,39 +257,84 @@ NS_COOKIE=session=xxx; pjwt=yyy&session=zzz; pjwt=www   # 纯 cookie，不登录
 （同样的 Vue SSR、同样的 `msc-script`、连 `fog` 指纹服务都同一个），
 接口和返回结构完全一致，所以签到逻辑直接复用，只是换域名。
 
-配置只加一个 cookie，二选一：
+**登录是全自动的**，跟 NS 一样不需要手工贴 cookie。原理是 DF 的
+「NodeSeek 一键登录」本质上是 NodeSeek Connect（OAuth）：
 
-```bash
-# 方式 1：写文件（推荐，不用动 .env）
-#   内容就是浏览器里的 cookie 串
-echo 'session=xxx; cf_clearance=yyy' > cookie/DEEPFLOOD_COOKIE_1.txt
-
-# 方式 2：写进 .env
-DF_COOKIE=session=xxx; cf_clearance=yyy
+```
+DF  nsSignIn.html  点「NodeSeek一键登录」
+  → window.open("https://www.nodeseek.com/connect?target=DeepFlood")
+    NS  connect 页  点 Connect
+      → GET /api/cAuth?target=DeepFlood      ← 用 NS 自己的登录态换身份
+      → window.opener.postMessage({source:"ns-connect", data, wtf, sign})
+    DF  收到消息  → POST /api/account/nodeseek-signIn
+      → Set-Cookie（登录完成）
 ```
 
-cookie 怎么取：浏览器登录 deepflood.com → `F12` → Application（应用）→
-Cookies → `https://www.deepflood.com` → 把 **HttpOnly 的那些也要** 拼成
-`name=value; name2=value2`。
+第 3 步只认 NS 的 cookie：未登录时返回 `{"message":"USER NOT FOUND","status":404}`。
+**这就是为什么换一个浏览器/换一个 profile 就不能一键登录** —— 弹窗只会显示 NS 登录页。
 
-多账号用 `&` 分隔，和 NS 一样。
+所以脚本的做法是：复用该 NS 账号的 profile，并把**已保存的 NS cookie 注入浏览器**，
+再点一键登录。注入比指望 profile 里还留着登录态可靠得多，原因有两个：
 
-**和 NS 的三点差异：**
+- NS 的 profile 目录名由 `_safe(用户名)` 生成，只保留 `[0-9A-Za-z._-]`，
+  **纯中文账号会被压成 `account`**，多个中文账号直接撞同一个目录；
+- 登录 cookie 约 30 天到期，profile 里那份经常已经不可用。
+
+#### 配置（多账号必看）
+
+唯一必须配的是「DF 账号 ↔ NS 账号」的对应关系，因为一键登录授权到的是
+**该 NS 账号绑定的那个 DF 号**：
+
+```bash
+# 按 DF 账号顺序填 NS 账号名，& 分隔（加引号，否则 shell 会吃掉 &）
+DF_NS_ACCOUNT="账号A&账号B"
+```
+
+意思是：DF 第 1 个账号用「账号A」的 profile + cookie 去授权，
+第 2 个用「账号B」的。**顺序要和 `DF_USER_PASS` 一致**。
+
+不配时会拿 DF 用户名当 NS 账号名 —— 两边同名就能直接用。
+
+再配上账号密码当兜底（DF 和 NS 密码一样的话，直接照抄）：
+
+```bash
+DF_USER_PASS=账号A&密码A&账号B&密码B
+```
+
+#### 先实测一次
+
+本机没有浏览器，所以第一次请在 VPS 上跑这个探测脚本，它会把每一步都打出来：
+
+```bash
+cd /root/nodeseek-autosign
+.venv/bin/python df_probe.py 1            # 第 1 个账号
+.venv/bin/python df_probe.py 1 --save     # 成功后顺便存下 cookie
+.venv/bin/python df_probe.py 1 --check-only   # 只检查 NS 登录态
+```
+
+它依次做：注入 NS cookie → 检查 NS 登录态 → 点一键登录 → 处理 NS 授权弹窗 →
+确认 DF 登录态 → 验证 cookie 被接口接受。失败时会直接告诉你卡在哪一步。
+
+跑通之后 cron 不用改，`run_sign.sh` 会照常带 DF 一起签。
+
+#### 和最早期版本的差异
 
 | | NodeSeek | DeepFlood |
 |---|---|---|
-| 自动登录 | 支持（Camoufox 过 Turnstile + 邮箱验证码） | **不支持**（登录必须走 NodeSeek Connect 授权或邮箱密码 + 人机验证，cron 里做不到） |
+| 自动登录 | Camoufox 过 Turnstile + 邮箱验证码 | **NodeSeek 一键登录**（复用 NS profile + 注入 NS cookie），失败回落账号密码 |
 | 签到参数 | `NS_RANDOM` 控制「试试手气」 | 固定 `random=true` 走「试试手气」（实测 10~12 个；固定按钮只有 5 个） |
-| cookie 失效后 | 自动重新登录 | 推 Telegram 提醒你手动换 cookie |
+| cookie 失效后 | 自动重新登录 | 自动重新走一键登录；NS cookie 也过期时会告警并说清原因 |
 
-> **不影响 NS。** 这个站点是纯新增的配置项：NS 的配置、请求参数、判定文案
-> 一个字符都没动，两边 cookie 也分别存在 `NODESEEK_COOKIE_*.txt` /
-> `DEEPFLOOD_COOKIE_*.txt`，互不覆盖。没配 `DF_COOKIE` 时 DF 会被直接跳过，
-> NS 照常签到。
+> **不影响 NS。** 这个站点是纯新增的：NS 的配置、请求参数、判定文案、
+> 登录路径一个字符都没动（`recover_cookie` 里按 `login_mode` 分流，
+> NS 没有这个键就走原来的 `browser_login_detail`）。两边 cookie 分别存在
+> `NODESEEK_COOKIE_*.txt` / `DEEPFLOOD_COOKIE_*.txt`，互不覆盖。
+> 没配 `DF_USER_PASS` 也没配 `DF_COOKIE` 时 DF 直接跳过，NS 照常签到。
 
 想改成固定 5 个：把 `SITES_CONFIG` 里 `deepflood` 的 `"random"` 改成 `"false"`。
+想让 DF 只用密码登录、不点一键登录：`DF_NS_CONNECT=false`。
 
-回归测试（不需要联网）：
+回归测试（不需要联网，也不需要浏览器）：
 
 ```bash
 python test_deepflood.py
@@ -313,6 +358,10 @@ python test_deepflood.py
 | `NS_TOTP_SECRET` | 空 | 账号开了 2FA 时填 Base32 密钥 |
 | `NS_RANDOM` | true | 签到奖励方式：`true` =「试试手气」（随机 1~5 鸡腿），`false` = 固定「鸡腿 x 5」 |
 | `NS_RENEW_BEFORE_DAYS` | 5 | cookie 剩余寿命不足几天就主动换新（设 0 关闭） |
+| `DF_NS_ACCOUNT` | 空 | **DeepFlood 必配**：按 DF 账号顺序填 NS 账号名，`&` 分隔，如 `"账号A&账号B"` |
+| `DF_USER_PASS` | 空 | DeepFlood 账号密码（一键登录失败时兜底），格式同 `NS_USER_PASS` |
+| `DF_NS_CONNECT` | true | 设 false 则 DF 只走账号密码，不点「NodeSeek 一键登录」 |
+| `DF_COOKIE` | 空 | 手工指定 DF cookie（优先级最高，配了就不自动登录） |
 | `NS_CODE_FILE` | 空 | 验证码落地文件路径（自动收码，不需要交出邮箱密码） |
 | `NS_CODE_URL` | 空 | HTTP 取码地址，返回纯文本验证码 |
 | `NS_IMAP_HOST` / `NS_IMAP_USER` / `NS_IMAP_PASS` | 空 | IMAP 自动收码（用邮箱授权码，不是登录密码） |
